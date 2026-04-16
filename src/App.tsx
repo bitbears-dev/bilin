@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { Play, Plus, Settings, X, Globe, ChevronRight, Loader2, Volume2, CheckCircle2 } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import { Readability } from "@mozilla/readability";
@@ -22,7 +22,7 @@ interface Session {
   url: string;
   title: string;
   paragraphs: Paragraph[];
-  iframeUrl: string;
+  iframeContent: string;
   isFetching: boolean;
 }
 
@@ -30,7 +30,6 @@ const getCacheKey = (text: string, lang: string) => {
   return lang === "Japanese" ? `trans_${text}` : `trans_${lang}_${text}`;
 };
 
-// キャッシュ用のラッパー関数
 const setCacheRecord = async (key: string, data: any) => {
   try { await set(key, { data, timestamp: Date.now() }); } catch(e){}
 };
@@ -38,7 +37,6 @@ const setCacheRecord = async (key: string, data: any) => {
 const getCacheRecord = async (key: string) => {
   try {
     const res: any = await get(key);
-    // 古い生データは res.timestamp が undefined なので破棄扱いとなる
     if (res && typeof res === 'object' && res.timestamp) {
        return res.data;
     }
@@ -46,29 +44,25 @@ const getCacheRecord = async (key: string) => {
   return null;
 }
 
-// 起動時のバックグラウンドパージ処理
 const purgeOldCaches = async () => {
   try {
     const allEntries = await entries();
     const now = Date.now();
-    const expiry = 180 * 24 * 60 * 60 * 1000; // 180日
+    const expiry = 180 * 24 * 60 * 60 * 1000;
     
-    // trans_ または audio_ キーのみ抽出
     const cacheEntries = allEntries.filter(([k]) => k.toString().startsWith("trans_") || k.toString().startsWith("audio_"));
     
     const toDelete = cacheEntries.filter(([k, v]: [any, any]) => {
-      if (!v || !v.timestamp) return true; // 古い形式の場合は削除パージの対象
-      return now - v.timestamp > expiry; // 期限切れを削除
+      if (!v || !v.timestamp) return true;
+      return now - v.timestamp > expiry;
     });
 
     for (const [k] of toDelete) {
         await del(k);
     }
     
-    // 残りの有効なキャッシュデータ
     const remaining = cacheEntries.filter(([k, v]: [any, any]) => v && v.timestamp && (now - v.timestamp <= expiry));
     if (remaining.length > 10000) {
-      // 古い順にソートして、上限(10000件)を超えた分を削除
       remaining.sort((a: any, b: any) => a[1].timestamp - b[1].timestamp);
       const limitDelete = remaining.slice(0, remaining.length - 10000);
       for (const [k] of limitDelete) {
@@ -80,8 +74,9 @@ const purgeOldCaches = async () => {
   }
 };
 
-
 function App() {
+  const iframeRef = useRef<HTMLIFrameElement>(null);
+
   const [apiKey, setApiKey] = useState("");
   const [targetLanguage, setTargetLanguage] = useState("Japanese");
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
@@ -90,7 +85,7 @@ function App() {
   const [cacheSizeMb, setCacheSizeMb] = useState<number | null>(null);
 
   const [sessions, setSessions] = useState<Session[]>([{
-    id: "default", url: "", title: "", paragraphs: [], iframeUrl: "", isFetching: false,
+    id: "default", url: "", title: "", paragraphs: [], iframeContent: "", isFetching: false,
   }]);
   const [activeSessionId, setActiveSessionId] = useState<string>("default");
 
@@ -106,12 +101,13 @@ function App() {
       setTempLanguage(lang);
     }
 
-    // セッション復元
     get("bilin_sessions").then((saved) => {
       if (saved && Array.isArray(saved) && saved.length > 0) {
         const resetSaved = saved.map(s => ({
             ...s,
             isFetching: false,
+            // 過去の iframeUrl を消すための互換対応
+            iframeContent: s.iframeContent || s.iframeUrl || "",
             paragraphs: s.paragraphs.map((p: any) => ({
                 ...p, isLoading: false, isAudioLoading: false, isPlaying: false 
             }))
@@ -122,7 +118,6 @@ function App() {
       setIsLoaded(true);
     });
 
-    // バックグラウンド・アイドル時にキャッシュパージを実行（少し間隔を置く）
     const timer = setTimeout(() => {
       if ('requestIdleCallback' in window) {
         window.requestIdleCallback(() => purgeOldCaches());
@@ -133,7 +128,6 @@ function App() {
     return () => clearTimeout(timer);
   }, []);
 
-  // 設定が開かれたときにキャッシュ容量を計算
   useEffect(() => {
     if (isSettingsOpen) {
       calculateCacheSize();
@@ -141,7 +135,7 @@ function App() {
   }, [isSettingsOpen]);
 
   const calculateCacheSize = async () => {
-    setCacheSizeMb(null); // 計算中
+    setCacheSizeMb(null);
     try {
       if (navigator.storage && navigator.storage.estimate) {
         const estimate = await navigator.storage.estimate();
@@ -150,12 +144,10 @@ function App() {
           return;
         }
       }
-      // フォールバック計算
       const all = await entries();
       let totalBytes = 0;
       all.forEach(([k, v]: any) => {
         if (k.toString().startsWith("trans_") || k.toString().startsWith("audio_")) {
-          // v.data に実データが格納されている
           if (v && v.data instanceof Blob) {
              totalBytes += v.data.size;
           } else if (v && typeof v.data === "string") {
@@ -186,7 +178,9 @@ function App() {
 
   useEffect(() => {
     if (isLoaded) {
-      set("bilin_sessions", sessions).catch(console.warn);
+      set("bilin_sessions", sessions.map(s => {
+         return s;
+      })).catch(console.warn);
     }
   }, [sessions, isLoaded]);
 
@@ -207,7 +201,7 @@ function App() {
   const handleAddNewSession = () => {
     const newId = Date.now().toString();
     setSessions(prev => [...prev, {
-      id: newId, url: "", title: "", paragraphs: [], iframeUrl: "", isFetching: false
+      id: newId, url: "", title: "", paragraphs: [], iframeContent: "", isFetching: false
     }]);
     setActiveSessionId(newId);
   };
@@ -219,7 +213,7 @@ function App() {
       if (filtered.length === 0) {
         const newId = Date.now().toString();
         setActiveSessionId(newId);
-        return [{ id: newId, url: "", title: "", paragraphs: [], iframeUrl: "", isFetching: false }];
+        return [{ id: newId, url: "", title: "", paragraphs: [], iframeContent: "", isFetching: false }];
       }
       if (idToClose === activeSessionId) {
         setActiveSessionId(filtered[filtered.length - 1].id);
@@ -232,7 +226,7 @@ function App() {
     if (e) e.preventDefault();
     if (!activeSession.url) return;
 
-    updateActiveSession({ isFetching: true, paragraphs: [], iframeUrl: "", title: "" });
+    updateActiveSession({ isFetching: true, paragraphs: [], iframeContent: "", title: "" });
     
     try {
       const html: string = await invoke("fetch_html", { url: activeSession.url });
@@ -245,9 +239,8 @@ function App() {
 
       if (article && article.content) {
         const pageTitle = article.title || "Untitled Article";
-        
         const contentDoc = parser.parseFromString(article.content, "text/html");
-        const elements = Array.from(contentDoc.querySelectorAll('p, h1, h2, h3, h4, li, blockquote'));
+        const elements = Array.from(contentDoc.querySelectorAll('p, h1, h2, h3, h4, li, blockquote')).filter(el => !el.closest('nav'));
         
         const extracted: Paragraph[] = [];
         elements.forEach((el, index) => {
@@ -265,7 +258,110 @@ function App() {
           }
         });
         
-        updateActiveSession({ title: pageTitle, paragraphs: [...extracted], iframeUrl: activeSession.url });
+        // --- 注入 (インジェクション) 用 HTML の生成 ---
+        const urlObj = new URL(activeSession.url);
+        const baseUrl = urlObj.origin + urlObj.pathname;
+
+        const injectionScript = `
+          <base href="${baseUrl}">
+          <script>
+            // ブラウザのデフォルト選択ハイライトを青色に上書き
+            const style = document.createElement('style');
+            style.innerHTML = '::selection { background: rgba(59, 130, 246, 0.4) !important; color: inherit; }';
+            document.head.appendChild(style);
+
+            window.addEventListener('message', (event) => {
+              if (event.data && event.data.type === 'HIGHLIGHT') {
+                 const text = event.data.text;
+                 if (!text) return;
+                 
+                 // 以前のハイライトを削除
+                 document.querySelectorAll('.bilin-highlight-fx').forEach(el => {
+                    el.classList.remove('bilin-highlight-fx');
+                    el.style.backgroundColor = '';
+                    el.style.boxShadow = '';
+                 });
+
+                 const normalize = (s) => s.replace(/\\s+/g, ' ').trim();
+                 const normText = normalize(text);
+
+                 const elements = Array.from(document.body.querySelectorAll('p, h1, h2, h3, h4, li, blockquote, div'));
+                 let bestMatch = null;
+                 let bestScore = 0;
+
+                 // 要素単位でのマッチングを行う
+                 for (const el of elements) {
+                    const normElText = normalize(el.textContent || '');
+                    if (normElText.length < 10) continue;
+
+                    if (normElText === normText) {
+                       bestMatch = el;
+                       bestScore = 1;
+                       break;
+                    }
+
+                    if (normElText.includes(normText) || normText.includes(normElText)) {
+                       const ratio = Math.min(normElText.length, normText.length) / Math.max(normElText.length, normText.length);
+                       if (ratio > bestScore) {
+                          bestScore = ratio;
+                          bestMatch = el;
+                       }
+                    }
+                 }
+
+                 // 完全にも包含にもマッチしなかった場合、先頭と末尾のテキストで包含を探る
+                 if (!bestMatch && normText.length > 40) {
+                    const shortText = normText.substring(0, 30);
+                    const tailText = normText.substring(normText.length - 30);
+                    for (const el of elements) {
+                       const normElText = normalize(el.textContent || '');
+                       if (normElText.includes(shortText) && normElText.includes(tailText)) {
+                          const ratio = normText.length / Math.max(normElText.length, normText.length);
+                          if (ratio > bestScore) {
+                             bestScore = ratio;
+                             bestMatch = el;
+                          }
+                       }
+                    }
+                 }
+
+                 if (bestMatch && bestScore > 0.4) {
+                    // スコアが十分高ければ、その要素自体にハイライト色をつけてスクロール
+                    bestMatch.classList.add('bilin-highlight-fx');
+                    bestMatch.style.backgroundColor = 'rgba(59, 130, 246, 0.15)';
+                    bestMatch.style.boxShadow = '0 0 0 4px rgba(59, 130, 246, 0.15)';
+                    bestMatch.style.borderRadius = '4px';
+                    bestMatch.style.transition = 'all 0.4s ease';
+                    bestMatch.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                 } else {
+                    // 最終フォールバックとしてブラウザのデフォルト検索
+                    const sel = window.getSelection();
+                    if(sel) {
+                       sel.removeAllRanges();
+                       sel.collapse(document.body, 0);
+                    }
+                    const shortTextFallback = text.length > 40 ? text.substring(0, 40) : text;
+                    let found = window.find(text, false, false, true, false, false, false);
+                    if (!found && text.length > 40) {
+                       found = window.find(shortTextFallback, false, false, true, false, false, false);
+                    }
+                    if (found) {
+                       setTimeout(() => window.scrollBy(0, -100), 50);
+                    }
+                 }
+              }
+            });
+          </script>
+        `;
+
+        let finalHtml = html;
+        if (finalHtml.toLowerCase().includes('<head>')) {
+           finalHtml = finalHtml.replace(/<head>/i, '<head>' + injectionScript);
+        } else {
+           finalHtml = injectionScript + finalHtml;
+        }
+
+        updateActiveSession({ title: pageTitle, paragraphs: [...extracted], iframeContent: finalHtml });
 
         extracted.forEach(async (p) => {
           try {
@@ -387,6 +483,12 @@ function App() {
     }
   };
 
+  const handleParagraphClick = (text: string) => {
+    if (iframeRef.current && iframeRef.current.contentWindow) {
+       iframeRef.current.contentWindow.postMessage({ type: 'HIGHLIGHT', text }, '*');
+    }
+  };
+
   if (!isLoaded) return null;
 
   return (
@@ -478,11 +580,12 @@ function App() {
         </form>
 
         <div className="flex-1 overflow-hidden relative bg-white flex shadow-inner">
-            {activeSession.iframeUrl ? (
+            {activeSession.iframeContent ? (
               <iframe 
-                src={activeSession.iframeUrl} 
+                ref={iframeRef}
+                srcDoc={activeSession.iframeContent} 
                 className="w-full h-full border-none"
-                sandbox="allow-scripts allow-same-origin"
+                sandbox="allow-scripts allow-same-origin allow-popups"
                 title="Original Content"
               />
             ) : activeSession.title ? (
@@ -524,12 +627,16 @@ function App() {
           )}
 
           {activeSession.paragraphs.map((p, i) => (
-            <div key={p.id} className="bg-white rounded-2xl p-5 shadow-[0_2px_12px_-4px_rgba(0,0,0,0.05)] border border-neutral-200/60 transition-all hover:shadow-md hover:border-blue-200 group relative overflow-hidden">
+            <div 
+              key={p.id} 
+              onClick={() => handleParagraphClick(p.originalText)}
+              className="bg-white rounded-2xl p-5 shadow-[0_2px_12px_-4px_rgba(0,0,0,0.05)] border border-neutral-200/60 transition-all hover:shadow-md hover:border-blue-300 group relative overflow-hidden cursor-pointer"
+            >
               {p.isPlaying && (
                 <div className="absolute top-0 left-0 w-full h-1 bg-blue-500 animate-pulse" />
               )}
               <div className="flex items-center justify-between mb-3">
-                 <span className="text-xs font-bold text-neutral-400">P{i + 1}</span>
+                 <span className="text-xs font-bold text-neutral-400 group-hover:text-blue-500 transition-colors">P{i + 1}</span>
                  {p.isCached && (
                    <span className="flex items-center space-x-1 text-[10px] font-bold text-emerald-500 bg-emerald-50 px-2 py-0.5 rounded-full">
                      <CheckCircle2 size={12} />
@@ -545,7 +652,7 @@ function App() {
               <div className="flex flex-col space-y-3">
                 {!p.translatedText ? (
                    <button 
-                    onClick={() => handleTranslate(i)}
+                    onClick={(e) => { e.stopPropagation(); handleTranslate(i); }}
                     disabled={p.isLoading}
                     className="flex items-center space-x-1.5 text-blue-600 bg-blue-50/50 hover:bg-blue-100/50 px-3 py-2 rounded-xl text-sm font-medium transition cursor-pointer self-start border border-blue-100/50 disabled:opacity-50"
                   >
@@ -560,7 +667,7 @@ function App() {
 
                 <div className="flex justify-end pt-2 mt-2 border-t border-transparent group-hover:border-neutral-50 transition-colors">
                   <button 
-                    onClick={() => handleListen(i)}
+                    onClick={(e) => { e.stopPropagation(); handleListen(i); }}
                     disabled={p.isAudioLoading || p.isPlaying}
                     className={`flex items-center space-x-1.5 px-4 py-1.5 rounded-full text-sm font-medium transition shadow-sm cursor-pointer border
                       ${p.isPlaying 
