@@ -1,0 +1,58 @@
+name: Build and Release
+
+on:
+  push:
+    # 'v' から始まるタグがPushされた時 (例: v1.0.0) に全OSビルド・リリースを自動実行
+    tags:
+      - 'v*'
+  # GitHubの画面(Actionsタブ)から手動で実行するための設定
+  workflow_dispatch:
+
+jobs:
+  release:
+    # 成果物のリリースを作成するための権限
+    permissions:
+      contents: write
+      
+    strategy:
+      fail-fast: false
+      matrix:
+        # Mac, Linux, Windows それぞれの環境を用意
+        platform: [macos-latest, ubuntu-22.04, windows-latest]
+        
+    runs-on: ${{ matrix.platform }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Node.js setup
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Rust setup
+        uses: dtolnay/rust-toolchain@stable
+
+      # Linux版のビルドに必要なシステムライブラリ（WebKit等）のインストール
+      - name: Install webkit2gtk (ubuntu only)
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+
+      - name: Install app dependencies
+        run: npm install
+
+      # Tauri公式のビルドアクション
+      - name: Build app and Create release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: app-v__VERSION__
+          releaseName: 'Bilin v__VERSION__'
+          releaseBody: 'これは自動的にビルドされた最新の Bilin アプリケーションです。お使いのOSに合わせたファイルをダウンロードしてください。'
+          releaseDraft: true # 一旦下書きとしてリリースを作成（手動で公開に切り替え可能）
+          prerelease: false
