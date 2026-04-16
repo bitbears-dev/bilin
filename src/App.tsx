@@ -4,7 +4,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { Readability } from "@mozilla/readability";
 import DOMPurify from "dompurify";
 import OpenAI from "openai";
-import { get, set } from "idb-keyval";
+import { get, set, entries, del } from "idb-keyval";
 import "./App.css";
 
 interface Paragraph {
@@ -26,10 +26,68 @@ interface Session {
   isFetching: boolean;
 }
 
+const getCacheKey = (text: string, lang: string) => {
+  return lang === "Japanese" ? `trans_${text}` : `trans_${lang}_${text}`;
+};
+
+// キャッシュ用のラッパー関数
+const setCacheRecord = async (key: string, data: any) => {
+  try { await set(key, { data, timestamp: Date.now() }); } catch(e){}
+};
+
+const getCacheRecord = async (key: string) => {
+  try {
+    const res: any = await get(key);
+    // 古い生データは res.timestamp が undefined なので破棄扱いとなる
+    if (res && typeof res === 'object' && res.timestamp) {
+       return res.data;
+    }
+  } catch(e) {}
+  return null;
+}
+
+// 起動時のバックグラウンドパージ処理
+const purgeOldCaches = async () => {
+  try {
+    const allEntries = await entries();
+    const now = Date.now();
+    const expiry = 180 * 24 * 60 * 60 * 1000; // 180日
+    
+    // trans_ または audio_ キーのみ抽出
+    const cacheEntries = allEntries.filter(([k]) => k.toString().startsWith("trans_") || k.toString().startsWith("audio_"));
+    
+    const toDelete = cacheEntries.filter(([k, v]: [any, any]) => {
+      if (!v || !v.timestamp) return true; // 古い形式の場合は削除パージの対象
+      return now - v.timestamp > expiry; // 期限切れを削除
+    });
+
+    for (const [k] of toDelete) {
+        await del(k);
+    }
+    
+    // 残りの有効なキャッシュデータ
+    const remaining = cacheEntries.filter(([k, v]: [any, any]) => v && v.timestamp && (now - v.timestamp <= expiry));
+    if (remaining.length > 10000) {
+      // 古い順にソートして、上限(10000件)を超えた分を削除
+      remaining.sort((a: any, b: any) => a[1].timestamp - b[1].timestamp);
+      const limitDelete = remaining.slice(0, remaining.length - 10000);
+      for (const [k] of limitDelete) {
+         await del(k);
+      }
+    }
+  } catch(e) {
+    console.error("Failed to purge caches", e);
+  }
+};
+
+
 function App() {
   const [apiKey, setApiKey] = useState("");
+  const [targetLanguage, setTargetLanguage] = useState("Japanese");
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [tempKey, setTempKey] = useState("");
+  const [tempLanguage, setTempLanguage] = useState("Japanese");
+  const [cacheSizeMb, setCacheSizeMb] = useState<number | null>(null);
 
   const [sessions, setSessions] = useState<Session[]>([{
     id: "default", url: "", title: "", paragraphs: [], iframeUrl: "", isFetching: false,
@@ -41,11 +99,16 @@ function App() {
   useEffect(() => {
     const key = localStorage.getItem("open_ai_api_key");
     if (key) setApiKey(key);
+    
+    const lang = localStorage.getItem("bilin_target_language");
+    if (lang) {
+      setTargetLanguage(lang);
+      setTempLanguage(lang);
+    }
 
-    // ロード時に保存されたセッション状態を復元する
+    // セッション復元
     get("bilin_sessions").then((saved) => {
       if (saved && Array.isArray(saved) && saved.length > 0) {
-        // UIの状態(ロード状況など)は初期値にリセットしてから復元する
         const resetSaved = saved.map(s => ({
             ...s,
             isFetching: false,
@@ -58,9 +121,69 @@ function App() {
       }
       setIsLoaded(true);
     });
+
+    // バックグラウンド・アイドル時にキャッシュパージを実行（少し間隔を置く）
+    const timer = setTimeout(() => {
+      if ('requestIdleCallback' in window) {
+        window.requestIdleCallback(() => purgeOldCaches());
+      } else {
+        purgeOldCaches();
+      }
+    }, 8000);
+    return () => clearTimeout(timer);
   }, []);
 
-  // sessions配列に変更があるたびにローカルDBに保存
+  // 設定が開かれたときにキャッシュ容量を計算
+  useEffect(() => {
+    if (isSettingsOpen) {
+      calculateCacheSize();
+    }
+  }, [isSettingsOpen]);
+
+  const calculateCacheSize = async () => {
+    setCacheSizeMb(null); // 計算中
+    try {
+      if (navigator.storage && navigator.storage.estimate) {
+        const estimate = await navigator.storage.estimate();
+        if (estimate.usage !== undefined) {
+          setCacheSizeMb(Math.round((estimate.usage / 1024 / 1024) * 100) / 100);
+          return;
+        }
+      }
+      // フォールバック計算
+      const all = await entries();
+      let totalBytes = 0;
+      all.forEach(([k, v]: any) => {
+        if (k.toString().startsWith("trans_") || k.toString().startsWith("audio_")) {
+          // v.data に実データが格納されている
+          if (v && v.data instanceof Blob) {
+             totalBytes += v.data.size;
+          } else if (v && typeof v.data === "string") {
+             totalBytes += v.data.length * 2;
+          }
+        }
+      });
+      setCacheSizeMb(Math.round((totalBytes / 1024 / 1024) * 100) / 100);
+    } catch(e) {
+      setCacheSizeMb(0);
+    }
+  };
+
+  const clearAllCaches = async () => {
+    if (!window.confirm("すべての翻訳と音声のキャッシュをリセットしますか？(APIキーやタブは保持されます)")) return;
+    try {
+      const all = await entries();
+      for (const [k] of all) {
+        if (k.toString().startsWith("trans_") || k.toString().startsWith("audio_")) {
+          await del(k);
+        }
+      }
+      setCacheSizeMb(0);
+    } catch(e) {
+      window.alert("エラーが発生しました。");
+    }
+  };
+
   useEffect(() => {
     if (isLoaded) {
       set("bilin_sessions", sessions).catch(console.warn);
@@ -73,9 +196,11 @@ function App() {
     setSessions(prev => prev.map(s => s.id === activeSessionId ? { ...s, ...updates } : s));
   };
 
-  const saveApiKey = () => {
+  const saveSettings = () => {
     localStorage.setItem("open_ai_api_key", tempKey);
+    localStorage.setItem("bilin_target_language", tempLanguage);
     setApiKey(tempKey);
+    setTargetLanguage(tempLanguage);
     setIsSettingsOpen(false);
   };
 
@@ -88,24 +213,17 @@ function App() {
   };
 
   const handleCloseSession = (idToClose: string, e: React.MouseEvent) => {
-    // タブクリックイベント(setActiveSessionId)が同時に発火するのを防ぐ
     e.stopPropagation();
-    
     setSessions(prev => {
       const filtered = prev.filter(s => s.id !== idToClose);
-      
-      // すべてのタブを閉じた場合、新規の空タブを作成
       if (filtered.length === 0) {
         const newId = Date.now().toString();
         setActiveSessionId(newId);
         return [{ id: newId, url: "", title: "", paragraphs: [], iframeUrl: "", isFetching: false }];
       }
-      
-      // アクティブなタブを閉じた場合は、リストの最後にあるタブをアクティブにする
       if (idToClose === activeSessionId) {
         setActiveSessionId(filtered[filtered.length - 1].id);
       }
-      
       return filtered;
     });
   };
@@ -149,11 +267,10 @@ function App() {
         
         updateActiveSession({ title: pageTitle, paragraphs: [...extracted], iframeUrl: activeSession.url });
 
-        // 背景でキャッシュされた翻訳をチェック
         extracted.forEach(async (p) => {
           try {
-            const cacheKey = `trans_${p.originalText}`;
-            const cachedTranslation = await get(cacheKey);
+            const cacheKey = getCacheKey(p.originalText, targetLanguage);
+            const cachedTranslation = await getCacheRecord(cacheKey);
             if (cachedTranslation && typeof cachedTranslation === "string") {
               setSessions(prev => prev.map(s => {
                 if(s.id === activeSessionId) {
@@ -191,7 +308,7 @@ function App() {
       const response = await openai.chat.completions.create({
         model: "gpt-4o-mini",
         messages: [
-          { role: "system", content: "You are a professional translator. Translate the following English text to Japanese accurately, naturally, and contextually. Do not output anything other than the translated text." },
+          { role: "system", content: `You are a professional translator. Translate the following English text to ${targetLanguage} accurately, naturally, and contextually. Do not output anything other than the translated text.` },
           { role: "user", content: p.originalText }
         ],
       });
@@ -199,7 +316,7 @@ function App() {
       const translated = response.choices[0]?.message?.content || "（翻訳に失敗しました）";
       
       try {
-        await set(`trans_${p.originalText}`, translated);
+        await setCacheRecord(getCacheKey(p.originalText, targetLanguage), translated);
       } catch(err) { }
 
       setSessions(prev => prev.map(s => s.id === activeSessionId ? {
@@ -227,7 +344,7 @@ function App() {
     } : s));
 
     try {
-      let cachedData: any = await get(`audio_${p.originalText}`);
+      let cachedData: any = await getCacheRecord(`audio_${p.originalText}`);
       let blob: Blob;
 
       if (!cachedData || (!(cachedData instanceof Blob) && !(cachedData instanceof ArrayBuffer) && !(cachedData instanceof Uint8Array))) {
@@ -241,7 +358,7 @@ function App() {
         const buffer = await mp3.arrayBuffer();
         blob = new Blob([buffer], { type: "audio/mpeg" });
         try {
-          await set(`audio_${p.originalText}`, blob);
+          await setCacheRecord(`audio_${p.originalText}`, blob);
         } catch (e) {}
       } else {
         blob = cachedData instanceof Blob ? cachedData : new Blob([cachedData as BlobPart], { type: "audio/mpeg" });
@@ -278,7 +395,7 @@ function App() {
       <aside className="w-60 flex-shrink-0 bg-white border-r border-neutral-200 flex flex-col py-4 z-20 shadow-sm relative overflow-y-hidden">
         <div className="px-4 mb-5 flex items-center space-x-3">
           <div className="w-8 h-8 rounded-lg bg-blue-600 flex items-center justify-center text-white font-bold shadow-md shrink-0">Bi</div>
-          <span className="font-bold text-neutral-800 tracking-wide text-lg">BiLin</span>
+          <span className="font-bold text-neutral-800 tracking-wide text-lg">Bilin</span>
         </div>
 
         <div className="flex-1 px-3 space-y-2 overflow-y-auto">
@@ -327,7 +444,7 @@ function App() {
         
         <div className="px-3 mt-4 pt-4 border-t border-neutral-100">
           <div 
-            onClick={() => { setTempKey(apiKey); setIsSettingsOpen(true); }}
+            onClick={() => { setTempKey(apiKey); setTempLanguage(targetLanguage); setIsSettingsOpen(true); }}
             className={`w-full h-10 rounded-xl hover:bg-neutral-100 flex items-center px-3 cursor-pointer transition text-sm font-medium ${!apiKey ? 'text-red-500' : 'text-neutral-600'}`}
           >
             <Settings size={18} className="mr-3" />
@@ -470,11 +587,11 @@ function App() {
       {/* 設定モーダル */}
       {isSettingsOpen && (
         <div className="fixed inset-0 bg-neutral-900/40 backdrop-blur-sm z-50 flex items-center justify-center p-4">
-          <div className="bg-white rounded-2xl w-full max-w-md shadow-2xl overflow-hidden animate-in fade-in zoom-in-95 duration-200">
-            <div className="h-14 border-b border-neutral-100 flex items-center justify-between px-6 bg-neutral-50/50">
+          <div className="bg-white rounded-2xl w-full max-w-md shadow-2xl overflow-hidden animate-in fade-in zoom-in-95 duration-200 flex flex-col max-h-screen">
+            <div className="h-14 border-b border-neutral-100 flex items-center justify-between px-6 bg-neutral-50/50 shrink-0">
               <h2 className="font-semibold text-neutral-800 flex items-center space-x-2">
                 <Settings size={18} className="text-neutral-500" />
-                <span>設定</span>
+                <span>設定 (Settings)</span>
               </h2>
               <button 
                 onClick={() => setIsSettingsOpen(false)}
@@ -483,7 +600,8 @@ function App() {
                 <X size={20} />
               </button>
             </div>
-            <div className="p-6 space-y-5">
+            
+            <div className="p-6 space-y-6 overflow-y-auto">
               <div>
                 <label className="block text-sm font-medium text-neutral-700 mb-1.5">OpenAI API Key</label>
                 <input 
@@ -497,12 +615,55 @@ function App() {
                   APIキーはブラウザのローカルストレージにのみ保存され、外部サーバには送信されません。
                 </p>
               </div>
+              
+              <div>
+                <label className="block text-sm font-medium text-neutral-700 mb-1.5">翻訳先の言語 (Target Language)</label>
+                <select 
+                  value={tempLanguage}
+                  onChange={(e) => setTempLanguage(e.target.value)}
+                  className="w-full bg-neutral-50 border border-neutral-300 rounded-lg px-3 py-2.5 text-sm focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 transition cursor-pointer"
+                >
+                  <option value="Japanese">Japanese (日本語)</option>
+                  <option value="Chinese (Simplified)">Chinese (簡体字)</option>
+                  <option value="Chinese (Traditional)">Chinese (繁体字)</option>
+                  <option value="Korean">Korean (韓国語)</option>
+                  <option value="Spanish">Spanish (スペイン語)</option>
+                  <option value="French">French (フランス語)</option>
+                  <option value="German">German (ドイツ語)</option>
+                  <option value="Italian">Italian (イタリア語)</option>
+                </select>
+              </div>
+
+              <div>
+                 <label className="block text-sm font-medium text-neutral-700 mb-1.5">データ管理 (Data Management)</label>
+                 <div className="flex items-center justify-between bg-neutral-50 px-4 py-3 rounded-lg border border-neutral-200">
+                    <div>
+                      <div className="text-sm font-medium text-neutral-800">キャッシュサイズ</div>
+                      <div className="text-xs text-neutral-500">翻訳テキストや音声の保存量</div>
+                    </div>
+                    <div className="flex items-center space-x-3">
+                      <span className="text-sm font-mono text-neutral-600 font-medium">
+                        {cacheSizeMb !== null ? `${cacheSizeMb} MB` : "計算中..."}
+                      </span>
+                      <button 
+                        onClick={clearAllCaches}
+                        className="px-3 py-1.5 bg-white border border-red-200 text-red-600 hover:bg-red-50 text-xs font-medium rounded-md transition"
+                      >
+                        クリア
+                      </button>
+                    </div>
+                 </div>
+                 <p className="text-xs text-neutral-500 mt-2 leading-relaxed">
+                   不要になった古い音声や翻訳データは、アプリご利用時（待機中）に裏側で自動的に削除されます。
+                 </p>
+              </div>
             </div>
-            <div className="bg-neutral-50 px-6 py-4 border-t border-neutral-100 flex justify-end space-x-3">
+            
+            <div className="bg-neutral-50 px-6 py-4 border-t border-neutral-100 flex justify-end space-x-3 shrink-0">
                <button onClick={() => setIsSettingsOpen(false)} className="px-4 py-2 text-sm font-medium text-neutral-600 hover:bg-neutral-200 rounded-lg transition">
                 キャンセル
               </button>
-              <button onClick={saveApiKey} className="px-5 py-2 text-sm font-medium text-white bg-blue-600 hover:bg-blue-700 rounded-lg transition shadow-sm">
+              <button onClick={saveSettings} className="px-5 py-2 text-sm font-medium text-white bg-blue-600 hover:bg-blue-700 rounded-lg transition shadow-sm">
                 保存
               </button>
             </div>
