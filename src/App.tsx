@@ -285,7 +285,9 @@ function App() {
                  const normalize = (s) => s.replace(/\\s+/g, ' ').trim();
                  const normText = normalize(text);
 
-                 const elements = Array.from(document.body.querySelectorAll('p, h1, h2, h3, h4, li, blockquote, div'));
+                 // nav要素内の要素(TOCなど)は検索対象から除外する
+                 const elements = Array.from(document.body.querySelectorAll('p, h1, h2, h3, h4, li, blockquote, div'))
+                    .filter(el => !el.closest('nav'));
                  let bestMatch = null;
                  let bestScore = 0;
 
