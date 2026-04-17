@@ -1,11 +1,16 @@
 import { useState, useEffect, useRef } from "react";
-import { Play, Plus, Settings, X, Globe, ChevronRight, Loader2, Volume2, CheckCircle2 } from "lucide-react";
+import { Play, Plus, Settings, X, Globe, ChevronRight, Loader2, CheckCircle2, Pause, Square } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import { Readability } from "@mozilla/readability";
 import DOMPurify from "dompurify";
 import OpenAI from "openai";
+import { Anthropic } from "@anthropic-ai/sdk";
+import { GoogleGenAI } from "@google/genai";
 import { get, set, entries, del } from "idb-keyval";
 import "./App.css";
+
+type TranslationProvider = "openai" | "anthropic" | "gemini";
+type AudioProvider = "openai" | "gemini";
 
 interface Paragraph {
   id: string;
@@ -14,6 +19,7 @@ interface Paragraph {
   isLoading: boolean;
   isAudioLoading: boolean;
   isPlaying: boolean;
+  isPaused?: boolean;
   isCached?: boolean;
 }
 
@@ -24,6 +30,8 @@ interface Session {
   paragraphs: Paragraph[];
   iframeContent: string;
   isFetching: boolean;
+  scrollPosition?: number;
+  iframeScrollPosition?: number;
 }
 
 const getCacheKey = (text: string, lang: string) => {
@@ -52,7 +60,7 @@ const purgeOldCaches = async () => {
     
     const cacheEntries = allEntries.filter(([k]) => k.toString().startsWith("trans_") || k.toString().startsWith("audio_"));
     
-    const toDelete = cacheEntries.filter(([k, v]: [any, any]) => {
+    const toDelete = cacheEntries.filter(([, v]: [any, any]) => {
       if (!v || !v.timestamp) return true;
       return now - v.timestamp > expiry;
     });
@@ -61,7 +69,7 @@ const purgeOldCaches = async () => {
         await del(k);
     }
     
-    const remaining = cacheEntries.filter(([k, v]: [any, any]) => v && v.timestamp && (now - v.timestamp <= expiry));
+    const remaining = cacheEntries.filter(([, v]: [any, any]) => v && v.timestamp && (now - v.timestamp <= expiry));
     if (remaining.length > 10000) {
       remaining.sort((a: any, b: any) => a[1].timestamp - b[1].timestamp);
       const limitDelete = remaining.slice(0, remaining.length - 10000);
@@ -74,15 +82,55 @@ const purgeOldCaches = async () => {
   }
 };
 
+const ObserverWrapper = ({ index, isAutoTranslate, onIntersect, children }: { index: number, isAutoTranslate: boolean, onIntersect: (index: number) => void, children: React.ReactNode }) => {
+  const ref = useRef<HTMLDivElement>(null);
+  const onIntersectRef = useRef(onIntersect);
+  useEffect(() => { onIntersectRef.current = onIntersect; }, [onIntersect]);
+
+  useEffect(() => {
+    if (!isAutoTranslate) return;
+
+    const observer = new IntersectionObserver(([entry]) => {
+      if (entry.isIntersecting) {
+        onIntersectRef.current(index);
+      }
+    }, { rootMargin: '0px 0px 50% 0px', threshold: 0 });
+    
+    if (ref.current) observer.observe(ref.current);
+    return () => observer.disconnect();
+  }, [index, isAutoTranslate]);
+  
+  return <div ref={ref}>{children}</div>;
+};
+
 function App() {
   const iframeRef = useRef<HTMLIFrameElement>(null);
+  const rightPaneRef = useRef<HTMLDivElement>(null);
+  const scrollTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const audioRefs = useRef<{ [key: string]: HTMLAudioElement }>({});
 
-  const [apiKey, setApiKey] = useState("");
+  const [translationProvider, setTranslationProvider] = useState<TranslationProvider>("openai");
+  const [audioProvider, setAudioProvider] = useState<AudioProvider>("openai");
+  
+  const [apiKeys, setApiKeys] = useState<Record<string, string>>({ openai: "", anthropic: "", gemini: "" });
+  const [aiModels, setAiModels] = useState<Record<string, string>>({ openai: "", anthropic: "claude-3-7-sonnet-latest", gemini: "gemini-2.5-pro" });
+  const [audioVoices, setAudioVoices] = useState<Record<string, string>>({ openai: "alloy", gemini: "Kore" });
+
   const [targetLanguage, setTargetLanguage] = useState("Japanese");
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
-  const [tempKey, setTempKey] = useState("");
+
+  const [tempTranslationProvider, setTempTranslationProvider] = useState<TranslationProvider>("openai");
+  const [tempAudioProvider, setTempAudioProvider] = useState<AudioProvider>("openai");
+  const [tempApiKeys, setTempApiKeys] = useState<Record<string, string>>({ openai: "", anthropic: "", gemini: "" });
+  const [tempAiModels, setTempAiModels] = useState<Record<string, string>>({ openai: "", anthropic: "claude-3-7-sonnet-latest", gemini: "gemini-2.5-pro" });
+  const [tempAudioVoices, setTempAudioVoices] = useState<Record<string, string>>({ openai: "alloy", gemini: "Kore" });
+
   const [tempLanguage, setTempLanguage] = useState("Japanese");
+  const [availableModels, setAvailableModels] = useState<Record<string, string[]>>({ openai: [], anthropic: [], gemini: [] });
+  const [isFetchingModels, setIsFetchingModels] = useState(false);
   const [cacheSizeMb, setCacheSizeMb] = useState<number | null>(null);
+  const [isAutoTranslate, setIsAutoTranslate] = useState(false);
+  const [tempAutoTranslate, setTempAutoTranslate] = useState(false);
 
   const [sessions, setSessions] = useState<Session[]>([{
     id: "default", url: "", title: "", paragraphs: [], iframeContent: "", isFetching: false,
@@ -92,13 +140,68 @@ function App() {
   const [isLoaded, setIsLoaded] = useState(false);
 
   useEffect(() => {
-    const key = localStorage.getItem("open_ai_api_key");
-    if (key) setApiKey(key);
+    const savedTransProvider = localStorage.getItem("bilin_translation_provider") as TranslationProvider;
+    if (savedTransProvider) { setTranslationProvider(savedTransProvider); setTempTranslationProvider(savedTransProvider); }
     
+    const savedAudioProvider = localStorage.getItem("bilin_audio_provider") as AudioProvider;
+    if (savedAudioProvider) { setAudioProvider(savedAudioProvider); setTempAudioProvider(savedAudioProvider); }
+
+    const savedKeys = localStorage.getItem("bilin_api_keys");
+    if (savedKeys) {
+       const parsed = JSON.parse(savedKeys);
+       setApiKeys(prev => ({...prev, ...parsed}));
+       setTempApiKeys(prev => ({...prev, ...parsed}));
+    } else {
+       const oldKey = localStorage.getItem("open_ai_api_key");
+       if (oldKey) {
+           setApiKeys(prev => ({ ...prev, openai: oldKey }));
+           setTempApiKeys(prev => ({ ...prev, openai: oldKey }));
+       }
+    }
+
+    const savedModels = localStorage.getItem("bilin_ai_models");
+    if (savedModels) {
+       const parsed = JSON.parse(savedModels);
+       setAiModels(prev => ({...prev, ...parsed}));
+       setTempAiModels(prev => ({...prev, ...parsed}));
+    } else {
+       const oldModel = localStorage.getItem("bilin_ai_model");
+       if (oldModel) {
+           setAiModels(prev => ({ ...prev, openai: oldModel }));
+           setTempAiModels(prev => ({ ...prev, openai: oldModel }));
+       }
+    }
+
+    const savedVoices = localStorage.getItem("bilin_audio_voices");
+    if (savedVoices) {
+       const parsed = JSON.parse(savedVoices);
+       setAudioVoices(prev => ({...prev, ...parsed}));
+       setTempAudioVoices(prev => ({...prev, ...parsed}));
+    }
+
     const lang = localStorage.getItem("bilin_target_language");
     if (lang) {
       setTargetLanguage(lang);
       setTempLanguage(lang);
+    }
+
+    const autoTransSetting = localStorage.getItem("bilin_auto_translate");
+    if (autoTransSetting === "true") {
+      setIsAutoTranslate(true);
+      setTempAutoTranslate(true);
+    }
+
+    const cachedModels = localStorage.getItem("bilin_available_models");
+    if (cachedModels) {
+      try {
+        const parsed = JSON.parse(cachedModels);
+        if (Array.isArray(parsed)) {
+           // Migration from old array
+           setAvailableModels(prev => ({ ...prev, openai: parsed }));
+        } else {
+           setAvailableModels(prev => ({ ...prev, ...parsed }));
+        }
+      } catch (e) {}
     }
 
     get("bilin_sessions").then((saved) => {
@@ -109,7 +212,7 @@ function App() {
             // 過去の iframeUrl を消すための互換対応
             iframeContent: s.iframeContent || s.iframeUrl || "",
             paragraphs: s.paragraphs.map((p: any) => ({
-                ...p, isLoading: false, isAudioLoading: false, isPlaying: false 
+                ...p, isLoading: false, isAudioLoading: false, isPlaying: false, isPaused: false 
             }))
         }));
         setSessions(resetSaved);
@@ -133,6 +236,56 @@ function App() {
       calculateCacheSize();
     }
   }, [isSettingsOpen]);
+
+  const fetchModels = async (keyToUse?: string | React.MouseEvent) => {
+    const provider = tempTranslationProvider;
+    const key = typeof keyToUse === "string" ? keyToUse : (tempApiKeys[provider] || apiKeys[provider]);
+    if (!key) return;
+    setIsFetchingModels(true);
+    try {
+      let chatModels: string[] = [];
+      if (provider === "openai") {
+        const openai = new OpenAI({ apiKey: key, dangerouslyAllowBrowser: true });
+        const response = await openai.models.list();
+        chatModels = response.data.map(m => m.id).filter(id => id.startsWith("gpt") || id.startsWith("o1") || id.startsWith("o3")).sort();
+      } else if (provider === "anthropic") {
+        const anthropic = new Anthropic({ apiKey: key, dangerouslyAllowBrowser: true, defaultHeaders: { "anthropic-dangerously-allow-browser": "true" } });
+        const response = await anthropic.models.list();
+        chatModels = response.data.map(m => m.id).filter(id => id.includes("claude")).sort();
+      } else if (provider === "gemini") {
+        const genAI = new GoogleGenAI({ apiKey: key });
+        // The sdk allows fetching models through list() for generative models
+        const response = await genAI.models.list();
+        for await (const m of response) {
+           if (m.name && m.name.includes("gemini")) {
+               chatModels.push(m.name);
+           }
+        }
+        chatModels.sort();
+      }
+      
+      if (chatModels.length > 0) {
+        setAvailableModels(prev => {
+           const updated = { ...prev, [provider]: chatModels };
+           localStorage.setItem("bilin_available_models", JSON.stringify(updated));
+           return updated;
+        });
+        if (!tempAiModels[provider] && chatModels.length > 0) {
+           setTempAiModels(prev => ({ ...prev, [provider]: chatModels[0] }));
+        }
+      }
+    } catch (e) {
+      console.warn("Failed to fetch models", e);
+    } finally {
+      setIsFetchingModels(false);
+    }
+  };
+
+  useEffect(() => {
+    if (apiKeys.openai && (!availableModels.openai || availableModels.openai.length === 0) && !isFetchingModels && tempTranslationProvider === "openai") {
+      fetchModels(apiKeys.openai);
+    }
+  }, [apiKeys.openai, availableModels.openai?.length, tempTranslationProvider]);
 
   const calculateCacheSize = async () => {
     setCacheSizeMb(null);
@@ -186,15 +339,33 @@ function App() {
 
   const activeSession = sessions.find(s => s.id === activeSessionId) || sessions[0];
 
+  useEffect(() => {
+    if (rightPaneRef.current && isLoaded) {
+      rightPaneRef.current.scrollTop = activeSession.scrollPosition || 0;
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeSessionId, isLoaded]);
+
   const updateActiveSession = (updates: Partial<Session>) => {
     setSessions(prev => prev.map(s => s.id === activeSessionId ? { ...s, ...updates } : s));
   };
 
   const saveSettings = () => {
-    localStorage.setItem("open_ai_api_key", tempKey);
+    localStorage.setItem("bilin_translation_provider", tempTranslationProvider);
+    localStorage.setItem("bilin_audio_provider", tempAudioProvider);
+    localStorage.setItem("bilin_api_keys", JSON.stringify(tempApiKeys));
+    localStorage.setItem("bilin_ai_models", JSON.stringify(tempAiModels));
+    localStorage.setItem("bilin_audio_voices", JSON.stringify(tempAudioVoices));
     localStorage.setItem("bilin_target_language", tempLanguage);
-    setApiKey(tempKey);
+    localStorage.setItem("bilin_auto_translate", tempAutoTranslate ? "true" : "false");
+    
+    setTranslationProvider(tempTranslationProvider);
+    setAudioProvider(tempAudioProvider);
+    setApiKeys(tempApiKeys);
+    setAiModels(tempAiModels);
+    setAudioVoices(tempAudioVoices);
     setTargetLanguage(tempLanguage);
+    setIsAutoTranslate(tempAutoTranslate);
     setIsSettingsOpen(false);
   };
 
@@ -253,6 +424,7 @@ function App() {
               isLoading: false,
               isAudioLoading: false,
               isPlaying: false,
+              isPaused: false,
               isCached: false,
             });
           }
@@ -270,7 +442,46 @@ function App() {
             style.innerHTML = '::selection { background: rgba(59, 130, 246, 0.4) !important; color: inherit; }';
             document.head.appendChild(style);
 
+            document.addEventListener('click', (e) => {
+               const a = e.target.closest('a');
+               if (a) {
+                  const hrefAttr = a.getAttribute('href');
+                  if (hrefAttr && hrefAttr.startsWith('#')) {
+                     e.preventDefault();
+                     try {
+                        const targetEl = document.querySelector(hrefAttr) || document.getElementById(hrefAttr.substring(1));
+                        if (targetEl) targetEl.scrollIntoView({ behavior: 'smooth' });
+                     } catch(err) {}
+                     return;
+                  } else if (hrefAttr && !hrefAttr.startsWith('javascript:')) {
+                     e.preventDefault();
+                     window.open(a.href, '_blank');
+                     return;
+                  }
+               }
+
+               const target = e.target.closest('p, h1, h2, h3, h4, li, blockquote, div');
+               if (target) {
+                  const text = target.textContent;
+                  if (text && text.trim().length > 0) {
+                     window.parent.postMessage({ type: 'IFRAME_CLICK', text: text }, '*');
+                  }
+               }
+            });
+
+            let scrollTimeout;
+            window.addEventListener('scroll', () => {
+              if (scrollTimeout) clearTimeout(scrollTimeout);
+              scrollTimeout = setTimeout(() => {
+                 window.parent.postMessage({ type: 'IFRAME_SCROLL', scrollY: window.scrollY }, '*');
+              }, 500);
+            });
+
             window.addEventListener('message', (event) => {
+              if (event.data && event.data.type === 'RESTORE_SCROLL') {
+                 window.scrollTo(0, event.data.scrollY || 0);
+                 return;
+              }
               if (event.data && event.data.type === 'HIGHLIGHT') {
                  const text = event.data.text;
                  if (!text) return;
@@ -388,30 +599,77 @@ function App() {
     }
   };
 
-  const handleTranslate = async (index: number) => {
-    if (!apiKey) {
-      window.alert("APIキーが設定されていません。左の歯車アイコンから設定してください。");
+  const handleTranslate = async (index: number, isAuto: boolean = false) => {
+    const key = apiKeys[translationProvider];
+    const model = aiModels[translationProvider];
+
+    if (!key || !model) {
+      if (isAuto) return;
+      setTempTranslationProvider(translationProvider);
+      setTempApiKeys(apiKeys);
+      setTempAiModels(aiModels);
+      setTempLanguage(targetLanguage);
+      setIsSettingsOpen(true);
+      if (!key) window.alert("翻訳プロバイダーのAPIキーが設定されていません。左の歯車アイコンから設定してください。");
+      else window.alert("翻訳プロバイダーのAIモデルが選択されていません。");
       return;
     }
 
     const p = activeSession.paragraphs[index];
     if (p.translatedText || p.isLoading) return;
 
+    const cacheKey = getCacheKey(p.originalText, targetLanguage);
+    try {
+      const cachedTranslation = await getCacheRecord(cacheKey);
+      if (cachedTranslation && typeof cachedTranslation === "string") {
+        setSessions(prev => prev.map(s => s.id === activeSessionId ? {
+          ...s, paragraphs: s.paragraphs.map((pr, i) => i === index ? { ...pr, translatedText: cachedTranslation, isLoading: false, isCached: true } : pr)
+        } : s));
+        return;
+      }
+    } catch(err) {}
+
     setSessions(prev => prev.map(s => s.id === activeSessionId ? {
       ...s, paragraphs: s.paragraphs.map((pr, i) => i === index ? { ...pr, isLoading: true } : pr)
     } : s));
 
     try {
-      const openai = new OpenAI({ apiKey, dangerouslyAllowBrowser: true });
-      const response = await openai.chat.completions.create({
-        model: "gpt-4o-mini",
-        messages: [
-          { role: "system", content: `You are a professional translator. Translate the following English text to ${targetLanguage} accurately, naturally, and contextually. Do not output anything other than the translated text.` },
-          { role: "user", content: p.originalText }
-        ],
-      });
+      let translated = "";
+      const systemPrompt = `You are a professional translator. Translate the following English text to ${targetLanguage} accurately, naturally, and contextually. Do not output anything other than the translated text.`;
 
-      const translated = response.choices[0]?.message?.content || "（翻訳に失敗しました）";
+      if (translationProvider === "openai") {
+        const openai = new OpenAI({ apiKey: key, dangerouslyAllowBrowser: true });
+        const response = await openai.chat.completions.create({
+          model: model,
+          messages: [
+            { role: "system", content: systemPrompt },
+            { role: "user", content: p.originalText }
+          ],
+        });
+        translated = response.choices[0]?.message?.content || "（翻訳に失敗しました）";
+      } else if (translationProvider === "anthropic") {
+        const anthropic = new Anthropic({ apiKey: key, dangerouslyAllowBrowser: true, defaultHeaders: { "anthropic-dangerously-allow-browser": "true" } });
+        const response = await anthropic.messages.create({
+          model: model,
+          max_tokens: 1024,
+          system: systemPrompt,
+          messages: [{ role: "user", content: p.originalText }]
+        });
+        const contentBlock = response.content[0];
+        if (contentBlock && contentBlock.type === 'text') {
+           translated = contentBlock.text;
+        } else {
+           translated = "（翻訳に失敗しました）";
+        }
+      } else if (translationProvider === "gemini") {
+        const genAI = new GoogleGenAI({ apiKey: key });
+        const response = await genAI.models.generateContent({
+           model: model,
+           contents: p.originalText,
+           config: { systemInstruction: systemPrompt }
+        });
+        translated = response.text || "（翻訳に失敗しました）";
+      }
       
       try {
         await setCacheRecord(getCacheKey(p.originalText, targetLanguage), translated);
@@ -429,34 +687,70 @@ function App() {
   };
 
   const handleListen = async (index: number) => {
-    if (!apiKey) {
-      window.alert("APIキーが設定されていません。");
+    const key = apiKeys[audioProvider];
+    const voice = audioVoices[audioProvider];
+
+    if (!key) {
+      setTempAudioProvider(audioProvider);
+      setTempApiKeys(apiKeys);
+      setTempAudioVoices(audioVoices);
+      setIsSettingsOpen(true);
+      window.alert("音声プロバイダーのAPIキーが設定されていません。");
       return;
     }
 
     const p = activeSession.paragraphs[index];
-    if (p.isAudioLoading || p.isPlaying) return;
+    if (p.isAudioLoading || p.isPlaying || p.isPaused) return;
 
     setSessions(prev => prev.map(s => s.id === activeSessionId ? {
       ...s, paragraphs: s.paragraphs.map((pr, i) => i === index ? { ...pr, isAudioLoading: true } : pr)
     } : s));
 
     try {
-      let cachedData: any = await getCacheRecord(`audio_${p.originalText}`);
+      let cachedData: any = await getCacheRecord(`audio_${audioProvider}_${p.originalText}`);
       let blob: Blob;
 
       if (!cachedData || (!(cachedData instanceof Blob) && !(cachedData instanceof ArrayBuffer) && !(cachedData instanceof Uint8Array))) {
-        const openai = new OpenAI({ apiKey, dangerouslyAllowBrowser: true });
-        const mp3 = await openai.audio.speech.create({
-          model: "tts-1",
-          voice: "alloy",
-          input: p.originalText,
-        });
-
-        const buffer = await mp3.arrayBuffer();
-        blob = new Blob([buffer], { type: "audio/mpeg" });
+        if (audioProvider === "openai") {
+           const openai = new OpenAI({ apiKey: key, dangerouslyAllowBrowser: true });
+           const mp3 = await openai.audio.speech.create({
+             model: "tts-1",
+             voice: voice as any || "alloy",
+             input: p.originalText,
+           });
+           const buffer = await mp3.arrayBuffer();
+           blob = new Blob([buffer], { type: "audio/mpeg" });
+        } else if (audioProvider === "gemini") {
+           const ai = new GoogleGenAI({ apiKey: key });
+           const response = await ai.models.generateContent({
+             model: "gemini-2.5-flash-preview-tts",
+             contents: p.originalText,
+             config: {
+               responseModalities: ["AUDIO"],
+               speechConfig: {
+                 voiceConfig: {
+                   prebuiltVoiceConfig: {
+                     voiceName: voice || "Kore"
+                   }
+                 }
+               }
+             }
+           });
+           const data = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+           if (!data) throw new Error("Audio data not found in response");
+           const binaryString = window.atob(data);
+           const len = binaryString.length;
+           const bytes = new Uint8Array(len);
+           for (let i = 0; i < len; i++) {
+               bytes[i] = binaryString.charCodeAt(i);
+           }
+           blob = new Blob([bytes], { type: "audio/wav" });
+        } else {
+           throw new Error("Unsupported Audio Provider");
+        }
+        
         try {
-          await setCacheRecord(`audio_${p.originalText}`, blob);
+          await setCacheRecord(`audio_${audioProvider}_${p.originalText}`, blob);
         } catch (e) {}
       } else {
         blob = cachedData instanceof Blob ? cachedData : new Blob([cachedData as BlobPart], { type: "audio/mpeg" });
@@ -464,25 +758,58 @@ function App() {
 
       const audioUrl = URL.createObjectURL(blob);
       const audio = new Audio(audioUrl);
+      audioRefs.current[p.id] = audio;
 
       audio.onended = () => {
         setSessions(prev => prev.map(s => s.id === activeSessionId ? {
-          ...s, paragraphs: s.paragraphs.map((pr, i) => i === index ? { ...pr, isPlaying: false } : pr)
+          ...s, paragraphs: s.paragraphs.map((pr, i) => i === index ? { ...pr, isPlaying: false, isPaused: false } : pr)
         } : s));
         URL.revokeObjectURL(audioUrl);
+        delete audioRefs.current[p.id];
       };
 
       await audio.play();
       setSessions(prev => prev.map(s => s.id === activeSessionId ? {
-        ...s, paragraphs: s.paragraphs.map((pr, i) => i === index ? { ...pr, isPlaying: true, isAudioLoading: false } : pr)
+        ...s, paragraphs: s.paragraphs.map((pr, i) => i === index ? { ...pr, isPlaying: true, isAudioLoading: false, isPaused: false } : pr)
       } : s));
 
     } catch (err: any) {
       window.alert("音声の生成中にエラーが発生しました: " + err.message);
       setSessions(prev => prev.map(s => s.id === activeSessionId ? {
-        ...s, paragraphs: s.paragraphs.map((pr, i) => i === index ? { ...pr, isAudioLoading: false, isPlaying: false } : pr)
+        ...s, paragraphs: s.paragraphs.map((pr, i) => i === index ? { ...pr, isAudioLoading: false, isPlaying: false, isPaused: false } : pr)
       } : s));
     }
+  };
+
+  const handleAudioToggle = (index: number) => {
+    const p = activeSession.paragraphs[index];
+    const audio = audioRefs.current[p.id];
+    if (!audio) return;
+
+    if (p.isPlaying) {
+      audio.pause();
+      setSessions(prev => prev.map(s => s.id === activeSessionId ? {
+        ...s, paragraphs: s.paragraphs.map((pr, i) => i === index ? { ...pr, isPlaying: false, isPaused: true } : pr)
+      } : s));
+    } else if (p.isPaused) {
+      audio.play().catch(console.error);
+      setSessions(prev => prev.map(s => s.id === activeSessionId ? {
+        ...s, paragraphs: s.paragraphs.map((pr, i) => i === index ? { ...pr, isPlaying: true, isPaused: false } : pr)
+      } : s));
+    }
+  };
+
+  const handleAudioStop = (index: number) => {
+    const p = activeSession.paragraphs[index];
+    const audio = audioRefs.current[p.id];
+    if (audio) {
+      audio.pause();
+      audio.currentTime = 0;
+      delete audioRefs.current[p.id];
+    }
+    setSessions(prev => prev.map(s => s.id === activeSessionId ? {
+      ...s, paragraphs: s.paragraphs.map((pr, i) => i === index ? { ...pr, isPlaying: false, isPaused: false } : pr)
+    } : s));
   };
 
   const handleParagraphClick = (text: string) => {
@@ -490,6 +817,77 @@ function App() {
        iframeRef.current.contentWindow.postMessage({ type: 'HIGHLIGHT', text }, '*');
     }
   };
+
+  useEffect(() => {
+    const handleIframeMessage = (event: MessageEvent) => {
+      if (event.data && event.data.type === 'IFRAME_SCROLL') {
+        setSessions(prev => prev.map(s => s.id === activeSessionId ? { ...s, iframeScrollPosition: event.data.scrollY } : s));
+      } else if (event.data && event.data.type === 'IFRAME_CLICK') {
+        const text = event.data.text;
+        if (!text) return;
+
+        const normalize = (s: string) => s.replace(/\s+/g, ' ').trim();
+        const normText = normalize(text);
+
+        let bestMatchIdx = -1;
+        let bestScore = 0;
+
+        activeSession.paragraphs.forEach((p, idx) => {
+           const normP = normalize(p.originalText);
+           // Exact match
+           if (normP === normText) {
+              bestMatchIdx = idx;
+              bestScore = 1;
+              return;
+           }
+           // Substring match
+           if (normP.includes(normText) || normText.includes(normP)) {
+              const ratio = Math.min(normP.length, normText.length) / Math.max(normP.length, normText.length);
+              if (ratio > bestScore) {
+                 bestScore = ratio;
+                 bestMatchIdx = idx;
+              }
+           }
+        });
+
+        // Fallback matching with partial ends
+        if (bestMatchIdx === -1 && normText.length > 40) {
+           const shortText = normText.substring(0, 30);
+           const tailText = normText.substring(normText.length - 30);
+           activeSession.paragraphs.forEach((p, idx) => {
+              const normP = normalize(p.originalText);
+              if (normP.includes(shortText) && normP.includes(tailText)) {
+                 const ratio = normP.length / Math.max(normP.length, normText.length);
+                 if (ratio > bestScore) {
+                    bestScore = ratio;
+                    bestMatchIdx = idx;
+                 }
+              }
+           });
+        }
+
+        if (bestMatchIdx !== -1 && bestScore > 0.4) {
+           const pId = activeSession.paragraphs[bestMatchIdx].id;
+           const el = document.getElementById(`card-${pId}`);
+           if (el) {
+              el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+              
+              // Temporarily highlight the card
+              el.classList.add('ring-2', 'ring-blue-500', 'bg-blue-50');
+              const origShadow = el.style.boxShadow;
+              el.style.boxShadow = '0 0 0 4px rgba(59, 130, 246, 0.2)';
+              setTimeout(() => {
+                 el.classList.remove('ring-2', 'ring-blue-500', 'bg-blue-50');
+                 el.style.boxShadow = origShadow;
+              }, 1500);
+           }
+        }
+      }
+    };
+
+    window.addEventListener('message', handleIframeMessage);
+    return () => window.removeEventListener('message', handleIframeMessage);
+  }, [activeSessionId, activeSession.paragraphs]);
 
   if (!isLoaded) return null;
 
@@ -548,8 +946,17 @@ function App() {
         
         <div className="px-3 mt-4 pt-4 border-t border-neutral-100">
           <div 
-            onClick={() => { setTempKey(apiKey); setTempLanguage(targetLanguage); setIsSettingsOpen(true); }}
-            className={`w-full h-10 rounded-xl hover:bg-neutral-100 flex items-center px-3 cursor-pointer transition text-sm font-medium ${!apiKey ? 'text-red-500' : 'text-neutral-600'}`}
+            onClick={() => {
+              setTempTranslationProvider(translationProvider);
+              setTempAudioProvider(audioProvider);
+              setTempApiKeys(apiKeys);
+              setTempAiModels(aiModels);
+              setTempAudioVoices(audioVoices);
+              setTempLanguage(targetLanguage);
+              setTempAutoTranslate(isAutoTranslate);
+              setIsSettingsOpen(true);
+            }}
+            className={`w-full h-10 rounded-xl hover:bg-neutral-100 flex items-center px-3 cursor-pointer transition text-sm font-medium ${!apiKeys[translationProvider] ? 'text-red-500' : 'text-neutral-600'}`}
           >
             <Settings size={18} className="mr-3" />
             Settings
@@ -589,6 +996,11 @@ function App() {
                 className="w-full h-full border-none"
                 sandbox="allow-scripts allow-same-origin allow-popups"
                 title="Original Content"
+                onLoad={() => {
+                  if (iframeRef.current && iframeRef.current.contentWindow) {
+                     iframeRef.current.contentWindow.postMessage({ type: 'RESTORE_SCROLL', scrollY: activeSession.iframeScrollPosition || 0 }, '*');
+                  }
+                }}
               />
             ) : activeSession.title ? (
               <div className="flex flex-col items-center justify-center w-full p-8 text-center max-w-lg mx-auto">
@@ -611,17 +1023,48 @@ function App() {
       <aside className="w-[45%] min-w-[380px] max-w-[600px] bg-neutral-50 flex flex-col relative">
         <div className="h-14 bg-white border-b border-neutral-200 flex items-center justify-between px-5 z-10 shrink-0 shadow-sm">
           <span className="font-semibold text-neutral-800 flex items-center space-x-2">
-            <span>Reading & Translation (Tab {sessions.findIndex(s => s.id === activeSessionId) + 1})</span>
-            {!apiKey && (
+            <span>Reading & Translation</span>
+            {!apiKeys[translationProvider] && (
               <span className="bg-red-100 text-red-600 text-[10px] px-2 py-0.5 rounded-full font-bold uppercase tracking-wide">
                 API Key Required
               </span>
             )}
           </span>
-          <span className="text-xs text-neutral-400 font-medium">{activeSession.paragraphs.length} paragraphs</span>
+          <div className="flex items-center space-x-4">
+            <label className="flex items-center space-x-2 cursor-pointer group">
+              <div className="relative flex items-center">
+                <input 
+                  type="checkbox" 
+                  className="sr-only" 
+                  checked={isAutoTranslate}
+                  onChange={(e) => {
+                     setIsAutoTranslate(e.target.checked);
+                     localStorage.setItem("bilin_auto_translate", e.target.checked ? "true" : "false");
+                     setTempAutoTranslate(e.target.checked);
+                  }}
+                />
+                <div className={`block w-9 h-5 rounded-full transition-colors duration-200 ease-in-out ${isAutoTranslate ? 'bg-blue-500' : 'bg-neutral-300 group-hover:bg-neutral-400'}`}></div>
+                <div className={`absolute left-0.5 bg-white w-4 h-4 rounded-full transition-transform duration-200 ease-in-out shadow-sm ${isAutoTranslate ? 'translate-x-4' : 'translate-x-0'}`}></div>
+              </div>
+              <span className={`text-xs font-medium transition-colors ${isAutoTranslate ? 'text-blue-700' : 'text-neutral-500'}`}>
+                Auto Translate
+              </span>
+            </label>
+            <span className="text-xs text-neutral-400 font-medium">{activeSession.paragraphs.length} paragraphs</span>
+          </div>
         </div>
         
-        <div className="flex-1 overflow-y-auto p-5 py-6 space-y-6">
+        <div 
+          ref={rightPaneRef}
+          onScroll={(e) => {
+            const scrollTop = e.currentTarget.scrollTop;
+            if (scrollTimeoutRef.current) clearTimeout(scrollTimeoutRef.current);
+            scrollTimeoutRef.current = setTimeout(() => {
+               setSessions(prev => prev.map(s => s.id === activeSessionId ? { ...s, scrollPosition: scrollTop } : s));
+            }, 500);
+          }}
+          className="flex-1 overflow-y-auto p-5 py-6 space-y-6"
+        >
           {activeSession.paragraphs.length === 0 && !activeSession.isFetching && (
             <div className="h-full flex flex-col items-center justify-center text-neutral-400 text-sm text-center px-8 border-2 border-dashed border-neutral-200/50 rounded-2xl mx-2">
               左側でURLを入力するか、セッションを選択してください
@@ -629,11 +1072,21 @@ function App() {
           )}
 
           {activeSession.paragraphs.map((p, i) => (
-            <div 
+            <ObserverWrapper 
               key={p.id} 
-              onClick={() => handleParagraphClick(p.originalText)}
-              className="bg-white rounded-2xl p-5 shadow-[0_2px_12px_-4px_rgba(0,0,0,0.05)] border border-neutral-200/60 transition-all hover:shadow-md hover:border-blue-300 group relative overflow-hidden cursor-pointer"
+              index={i} 
+              isAutoTranslate={isAutoTranslate}
+              onIntersect={(idx) => {
+                if (isAutoTranslate && apiKeys[translationProvider] && aiModels[translationProvider] && !p.translatedText && !p.isLoading) {
+                  handleTranslate(idx, true);
+                }
+              }}
             >
+              <div 
+                id={`card-${p.id}`}
+                onClick={() => handleParagraphClick(p.originalText)}
+                className="bg-white rounded-2xl p-5 shadow-[0_2px_12px_-4px_rgba(0,0,0,0.05)] border border-neutral-200/60 transition-all hover:shadow-md hover:border-blue-300 group relative overflow-hidden cursor-pointer"
+              >
               {p.isPlaying && (
                 <div className="absolute top-0 left-0 w-full h-1 bg-blue-500 animate-pulse" />
               )}
@@ -668,27 +1121,45 @@ function App() {
                 )}
 
                 <div className="flex justify-end pt-2 mt-2 border-t border-transparent group-hover:border-neutral-50 transition-colors">
-                  <button 
-                    onClick={(e) => { e.stopPropagation(); handleListen(i); }}
-                    disabled={p.isAudioLoading || p.isPlaying}
-                    className={`flex items-center space-x-1.5 px-4 py-1.5 rounded-full text-sm font-medium transition shadow-sm cursor-pointer border
-                      ${p.isPlaying 
-                        ? 'bg-blue-100 text-blue-700 border-blue-200' 
-                        : 'bg-neutral-50 text-neutral-500 hover:text-blue-600 hover:bg-blue-50 border-neutral-100'}
-                      disabled:opacity-50`}
-                  >
-                    {p.isAudioLoading ? (
-                      <Loader2 size={15} className="animate-spin text-neutral-400" />
-                    ) : p.isPlaying ? (
-                      <Volume2 size={15} className="fill-current text-blue-600 animate-pulse" />
-                    ) : (
-                      <Play size={15} className="fill-current" />
-                    )}
-                    <span>{p.isAudioLoading ? "生成中..." : p.isPlaying ? "Playing" : "Listen"}</span>
-                  </button>
+                  {p.isPlaying || p.isPaused ? (
+                    <div className="flex items-center space-x-2">
+                       <button
+                         onClick={(e) => { e.stopPropagation(); handleAudioToggle(i); }}
+                         className={`flex items-center space-x-1.5 px-3 py-1.5 rounded-full text-sm font-medium transition shadow-sm cursor-pointer border ${p.isPlaying ? 'bg-blue-100 text-blue-700 border-blue-200' : 'bg-neutral-50 text-neutral-600 hover:bg-neutral-100 border-neutral-200'}`}
+                       >
+                         {p.isPlaying ? <Pause size={15} className="fill-current text-blue-600" /> : <Play size={15} className="fill-current" />}
+                         <span>{p.isPlaying ? "Pause" : "Resume"}</span>
+                       </button>
+                       <button
+                         onClick={(e) => { e.stopPropagation(); handleAudioStop(i); }}
+                         className="flex items-center space-x-1.5 px-3 py-1.5 rounded-full text-sm font-medium transition shadow-sm cursor-pointer border bg-red-50 text-red-600 hover:bg-red-100 border-red-200"
+                       >
+                         <Square size={13} className="fill-current" />
+                         <span>Stop</span>
+                       </button>
+                    </div>
+                  ) : (
+                    <button 
+                      onClick={(e) => { e.stopPropagation(); handleListen(i); }}
+                      disabled={p.isAudioLoading}
+                      className={`flex items-center space-x-1.5 px-4 py-1.5 rounded-full text-sm font-medium transition shadow-sm cursor-pointer border
+                        ${p.isAudioLoading
+                          ? 'bg-neutral-50 text-neutral-400 border-neutral-100'
+                          : 'bg-neutral-50 text-neutral-500 hover:text-blue-600 hover:bg-blue-50 border-neutral-100'}
+                        disabled:opacity-50`}
+                    >
+                      {p.isAudioLoading ? (
+                        <Loader2 size={15} className="animate-spin text-neutral-400" />
+                      ) : (
+                        <Play size={15} className="fill-current" />
+                      )}
+                      <span>{p.isAudioLoading ? "生成中..." : "Listen"}</span>
+                    </button>
+                  )}
                 </div>
               </div>
             </div>
+            </ObserverWrapper>
           ))}
         </div>
       </aside>
@@ -710,21 +1181,155 @@ function App() {
               </button>
             </div>
             
-            <div className="p-6 space-y-6 overflow-y-auto">
-              <div>
-                <label className="block text-sm font-medium text-neutral-700 mb-1.5">OpenAI API Key</label>
-                <input 
-                  type="password"
-                  value={tempKey}
-                  onChange={(e) => setTempKey(e.target.value)}
-                  placeholder="sk-..."
-                  className="w-full bg-neutral-50 border border-neutral-300 rounded-lg px-3 py-2.5 text-sm focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 transition font-mono"
-                />
-                <p className="text-xs text-neutral-500 mt-2 leading-relaxed">
-                  APIキーはブラウザのローカルストレージにのみ保存され、外部サーバには送信されません。
-                </p>
+                        <div className="p-6 space-y-6 overflow-y-auto">
+              {/* Translation Settings */}
+              <div className="p-4 rounded-xl border border-neutral-200 bg-neutral-50/50 space-y-4">
+                <h3 className="font-semibold text-neutral-800 text-sm">翻訳設定 (Translation)</h3>
+                
+                <div>
+                  <label className="block text-xs font-medium text-neutral-600 mb-1.5">Provider</label>
+                  <select 
+                    value={tempTranslationProvider}
+                    onChange={(e) => setTempTranslationProvider(e.target.value as TranslationProvider)}
+                    className="w-full bg-white border border-neutral-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-blue-500 focus:ring-1 transition cursor-pointer"
+                  >
+                    <option value="openai">OpenAI</option>
+                    <option value="anthropic">Anthropic (Claude)</option>
+                    <option value="gemini">Google (Gemini)</option>
+                  </select>
+                </div>
+
+                <div>
+                  <label className="block text-xs font-medium text-neutral-600 mb-1.5">API Key</label>
+                  <input 
+                    type="password"
+                    value={tempApiKeys[tempTranslationProvider] || ""}
+                    onChange={(e) => setTempApiKeys(prev => ({ ...prev, [tempTranslationProvider]: e.target.value }))}
+                    placeholder="API Key..."
+                    className="w-full bg-white border border-neutral-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-blue-500 focus:ring-1 transition font-mono"
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-xs font-medium text-neutral-600 mb-1.5 flex justify-between items-center">
+                    <span>AI Model</span>
+                    {tempApiKeys[tempTranslationProvider] && (
+                      <button 
+                        onClick={fetchModels} 
+                        disabled={isFetchingModels}
+                        className="text-[10px] text-blue-600 hover:text-blue-700 flex items-center space-x-1 disabled:opacity-50"
+                      >
+                        {isFetchingModels ? <Loader2 size={10} className="animate-spin" /> : null}
+                        <span>リスト更新</span>
+                      </button>
+                    )}
+                  </label>
+                  {tempTranslationProvider === "openai" ? (
+                    <select 
+                      value={tempAiModels.openai || ""}
+                      onChange={(e) => setTempAiModels(prev => ({ ...prev, openai: e.target.value }))}
+                      className="w-full bg-white border border-neutral-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-blue-500 focus:ring-1 transition cursor-pointer"
+                    >
+                      {availableModels.openai.map(m => <option key={m} value={m}>{m}</option>)}
+                      {!availableModels.openai.includes(tempAiModels.openai) && tempAiModels.openai && <option value={tempAiModels.openai}>{tempAiModels.openai}</option>}
+                    </select>
+                  ) : tempTranslationProvider === "anthropic" ? (
+                    <select 
+                      value={tempAiModels.anthropic || "claude-3-7-sonnet-latest"}
+                      onChange={(e) => setTempAiModels(prev => ({ ...prev, anthropic: e.target.value }))}
+                      className="w-full bg-white border border-neutral-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-blue-500 focus:ring-1 transition cursor-pointer"
+                    >
+                      {availableModels.anthropic.length > 0 ? (
+                         availableModels.anthropic.map(m => <option key={m} value={m}>{m}</option>)
+                      ) : (
+                         <>
+                           <option value="claude-3-7-sonnet-latest">Claude 3.7 Sonnet Default</option>
+                           <option value="claude-3-5-sonnet-20241022">Claude 3.5 Sonnet</option>
+                           <option value="claude-3-5-haiku-20241022">Claude 3.5 Haiku</option>
+                         </>
+                      )}
+                      {availableModels.anthropic.length > 0 && !availableModels.anthropic.includes(tempAiModels.anthropic) && tempAiModels.anthropic && <option value={tempAiModels.anthropic}>{tempAiModels.anthropic}</option>}
+                    </select>
+                  ) : (
+                    <select 
+                      value={tempAiModels.gemini || "gemini-2.5-pro"}
+                      onChange={(e) => setTempAiModels(prev => ({ ...prev, gemini: e.target.value }))}
+                      className="w-full bg-white border border-neutral-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-blue-500 focus:ring-1 transition cursor-pointer"
+                    >
+                      {availableModels.gemini.length > 0 ? (
+                         availableModels.gemini.map(m => <option key={m} value={m}>{m}</option>)
+                      ) : (
+                         <>
+                           <option value="gemini-2.5-pro">Gemini 2.5 Pro</option>
+                           <option value="gemini-2.5-flash">Gemini 2.5 Flash</option>
+                           <option value="gemini-2.0-flash">Gemini 2.0 Flash</option>
+                         </>
+                      )}
+                      {availableModels.gemini.length > 0 && !availableModels.gemini.includes(tempAiModels.gemini) && tempAiModels.gemini && <option value={tempAiModels.gemini}>{tempAiModels.gemini}</option>}
+                    </select>
+                  )}
+                </div>
               </div>
-              
+
+              {/* Audio Settings Node */}
+              <div className="p-4 rounded-xl border border-neutral-200 bg-neutral-50/50 space-y-4">
+                <h3 className="font-semibold text-neutral-800 text-sm">音声設定 (Text-to-Speech)</h3>
+                
+                <div>
+                  <label className="block text-xs font-medium text-neutral-600 mb-1.5">Provider</label>
+                  <select 
+                    value={tempAudioProvider}
+                    onChange={(e) => setTempAudioProvider(e.target.value as AudioProvider)}
+                    className="w-full bg-white border border-neutral-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-blue-500 focus:ring-1 transition cursor-pointer"
+                  >
+                    <option value="openai">OpenAI (TTS-1)</option>
+                    <option value="gemini">Google (Gemini TTS)</option>
+                  </select>
+                </div>
+
+                <div>
+                  <label className="block text-xs font-medium text-neutral-600 mb-1.5">API Key</label>
+                  <input 
+                    type="password"
+                    value={tempApiKeys[tempAudioProvider] || ""}
+                    onChange={(e) => setTempApiKeys(prev => ({ ...prev, [tempAudioProvider]: e.target.value }))}
+                    placeholder="API Key..."
+                    className="w-full bg-white border border-neutral-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-blue-500 focus:ring-1 transition font-mono"
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-xs font-medium text-neutral-600 mb-1.5">Voice</label>
+                  {tempAudioProvider === "openai" ? (
+                    <select 
+                      value={tempAudioVoices.openai || "alloy"}
+                      onChange={(e) => setTempAudioVoices(prev => ({ ...prev, openai: e.target.value }))}
+                      className="w-full bg-white border border-neutral-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-blue-500 focus:ring-1 transition cursor-pointer"
+                    >
+                      <option value="alloy">Alloy (Neutral)</option>
+                      <option value="echo">Echo (Male)</option>
+                      <option value="fable">Fable (British Male)</option>
+                      <option value="onyx">Onyx (Deep Male)</option>
+                      <option value="nova">Nova (Female)</option>
+                      <option value="shimmer">Shimmer (Soft Female)</option>
+                    </select>
+                  ) : (
+                    <select 
+                      value={tempAudioVoices.gemini || "Kore"}
+                      onChange={(e) => setTempAudioVoices(prev => ({ ...prev, gemini: e.target.value }))}
+                      className="w-full bg-white border border-neutral-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-blue-500 focus:ring-1 transition cursor-pointer"
+                    >
+                      <option value="Aoede">Aoede</option>
+                      <option value="Charon">Charon</option>
+                      <option value="Fenrir">Fenrir</option>
+                      <option value="Kore">Kore</option>
+                      <option value="Puck">Puck</option>
+                      <option value="Calliope">Calliope</option>
+                    </select>
+                  )}
+                </div>
+              </div>
+
               <div>
                 <label className="block text-sm font-medium text-neutral-700 mb-1.5">翻訳先の言語 (Target Language)</label>
                 <select 
@@ -741,6 +1346,26 @@ function App() {
                   <option value="German">German (ドイツ語)</option>
                   <option value="Italian">Italian (イタリア語)</option>
                 </select>
+              </div>
+
+
+
+              <div>
+                <label className="block text-sm font-medium text-neutral-700 mb-1.5 flex justify-between items-center">
+                  <span>Auto Translation (自動翻訳)</span>
+                  <label className="cursor-pointer relative inline-flex items-center">
+                      <input 
+                        type="checkbox" 
+                        className="sr-only peer"
+                        checked={tempAutoTranslate}
+                        onChange={(e) => setTempAutoTranslate(e.target.checked)}
+                      />
+                      <div className="w-10 h-5 bg-neutral-300 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-neutral-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-blue-600"></div>
+                  </label>
+                </label>
+                <p className="text-xs text-neutral-500 mt-1.5 leading-relaxed">
+                  カードが画面に表示されたタイミングで自動的に翻訳を実行します。APIの消費量にご注意ください。
+                </p>
               </div>
 
               <div>
