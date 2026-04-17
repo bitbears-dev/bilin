@@ -7,11 +7,11 @@ Bilin is a desktop application designed to bridge the gap for non-native English
 ## 🚀 Key Features
 
 - **Side-by-Side Reading**: View the original website layout in the center pane while interacting with extracted text cards on the right.
-- **Paragraph-Level Translation**: Translate text paragraph-by-paragraph using the OpenAI Chat API (`gpt-4o-mini`) for highly accurate context-aware meanings.
-- **Native Pronunciation TTS**: Click "Listen" to hear the original text spoken naturally using OpenAI's TTS API.
+- **Paragraph-Level Translation**: Translate text paragraph-by-paragraph using your choice of AI providers (OpenAI, Gemini, or Claude) for highly accurate context-aware meanings.
+- **Native Pronunciation TTS**: Click "Listen" to hear the original text spoken naturally using OpenAI or Gemini TTS.
 - **Cost-efficient Local Caching**: Translated text and audio binaries are automatically saved in the browser's IndexedDB. Revisiting them costs $0 and has zero latency.
-- **Multi-Tab Sessions**: Read multiple articles concurrently. Your reading state and tabs persist securely across app restarts.
-- **Bring Your Own Key (BYOK)**: Bilin runs exclusively on your personal API key stored securely in local storage, guaranteeing privacy and transparency.
+- **Multi-Tab Sessions**: Read multiple articles concurrently. Your reading state, tabs, and scroll positions persist securely across app restarts.
+- **Bring Your Own Key (BYOK)**: Bilin runs exclusively on your personal API keys stored securely in local storage, guaranteeing privacy and transparency.
 
 ---
 
@@ -50,12 +50,16 @@ npm run tauri build
 
 ## 📖 How to Use
 
-1. **Setup API Key**: On the bottom left of the sidebar, click the **Settings (Gear Icon)**. Input your personal OpenAI API Key and hit 'Save'.
+1. **Setup API Key & Models**: On the bottom left of the sidebar, click the **Settings (Gear Icon)**. 
+   - Select your preferred AI Provider (OpenAI, Gemini, or Claude) for translation, enter your API Key, and choose a model.
+   - Select your preferred TTS Provider (OpenAI or Gemini) for text-to-speech, enter your API Key, and choose a model. Hit 'Save'.
 2. **Open an Article**: In the top address bar, paste the URL of the English news or blog you want to read, and hit **"開く"** (Open).
 3. **Learn Interactively**: The parsed article text will appear on the right side as paragraph cards.
-   - Click **"翻訳を表示" (Translate)** if you're stuck on the meaning.
-   - Click **"Listen"** to listen to the proper pronunciation.
-4. **Manage Multiple Readings**: Click the **"+" (Plus icon)** on the left vertical sidebar to open an empty new tab without losing your existing progress.
+   - Click **"翻訳" (Translate)** if you're stuck on the meaning.
+   - Click **"Listen"** to hear the proper pronunciation. You can **Pause** or **Stop** the audio anytime.
+   - Enable **Auto Translate** in the top bar of the right pane to automatically translate cards as they become visible while scrolling.
+   - Click on any paragraph directly within the original website (center pane) to automatically scroll and focus its corresponding translation card on the right.
+4. **Manage Multiple Readings**: Click the **"+" (Plus icon)** on the left vertical sidebar to open an empty new tab without losing your existing progress. Your scroll positions inside the original website and the translation cards are securely preserved even across tabs!
 
 ---
 
