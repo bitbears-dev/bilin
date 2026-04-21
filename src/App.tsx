@@ -136,6 +136,7 @@ function App() {
     id: "default", url: "", title: "", paragraphs: [], iframeContent: "", isFetching: false,
   }]);
   const [activeSessionId, setActiveSessionId] = useState<string>("default");
+  const [activeParagraphId, setActiveParagraphId] = useState<string | null>(null);
 
   const [isLoaded, setIsLoaded] = useState(false);
 
@@ -844,7 +845,8 @@ function App() {
     } : s));
   };
 
-  const handleParagraphClick = (text: string) => {
+  const handleParagraphClick = (text: string, pId: string) => {
+    setActiveParagraphId(pId);
     if (iframeRef.current && iframeRef.current.contentWindow) {
        iframeRef.current.contentWindow.postMessage({ type: 'HIGHLIGHT', text }, '*');
     }
@@ -900,18 +902,10 @@ function App() {
 
         if (bestMatchIdx !== -1 && bestScore > 0.4) {
            const pId = activeSession.paragraphs[bestMatchIdx].id;
+           setActiveParagraphId(pId);
            const el = document.getElementById(`card-${pId}`);
            if (el) {
               el.scrollIntoView({ behavior: 'smooth', block: 'center' });
-              
-              // Temporarily highlight the card
-              el.classList.add('ring-2', 'ring-blue-500', 'bg-blue-50');
-              const origShadow = el.style.boxShadow;
-              el.style.boxShadow = '0 0 0 4px rgba(59, 130, 246, 0.2)';
-              setTimeout(() => {
-                 el.classList.remove('ring-2', 'ring-blue-500', 'bg-blue-50');
-                 el.style.boxShadow = origShadow;
-              }, 1500);
            }
         }
       }
@@ -1103,7 +1097,9 @@ function App() {
             </div>
           )}
 
-          {activeSession.paragraphs.map((p, i) => (
+          {activeSession.paragraphs.map((p, i) => {
+            const isSelected = activeParagraphId === p.id;
+            return (
             <ObserverWrapper 
               key={p.id} 
               index={i} 
@@ -1116,8 +1112,8 @@ function App() {
             >
               <div 
                 id={`card-${p.id}`}
-                onClick={() => handleParagraphClick(p.originalText)}
-                className="bg-white rounded-2xl p-5 shadow-[0_2px_12px_-4px_rgba(0,0,0,0.05)] border border-neutral-200/60 transition-all hover:shadow-md hover:border-blue-300 group relative overflow-hidden cursor-pointer"
+                onClick={() => handleParagraphClick(p.originalText, p.id)}
+                className={`rounded-2xl p-5 shadow-[0_2px_12px_-4px_rgba(0,0,0,0.05)] border transition-all hover:shadow-md hover:border-blue-300 group relative overflow-hidden cursor-pointer ${isSelected ? 'bg-blue-50/50 border-blue-400 ring-2 ring-blue-500/50' : 'bg-white border-neutral-200/60'}`}
               >
               {p.isPlaying && (
                 <div className="absolute top-0 left-0 w-full h-1 bg-blue-500 animate-pulse" />
@@ -1192,7 +1188,8 @@ function App() {
               </div>
             </div>
             </ObserverWrapper>
-          ))}
+            );
+          })}
         </div>
       </aside>
 
