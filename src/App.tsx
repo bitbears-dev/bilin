@@ -400,35 +400,67 @@ function App() {
     updateActiveSession({ isFetching: true, paragraphs: [], iframeContent: "", title: "" });
     
     try {
-      const html: string = await invoke("fetch_html", { url: activeSession.url });
+      let html: string = await invoke("fetch_html", { url: activeSession.url });
       
-      const parser = new DOMParser();
-      const cleanHtml = DOMPurify.sanitize(html, { USE_PROFILES: { html: true } });
-      const doc = parser.parseFromString(cleanHtml, "text/html");
-      const reader = new Readability(doc);
-      const article = reader.parse();
+      const processHtml = (htmlStr: string) => {
+        const parser = new DOMParser();
+        const cleanHtml = DOMPurify.sanitize(htmlStr, { USE_PROFILES: { html: true } });
+        const doc = parser.parseFromString(cleanHtml, "text/html");
+        const reader = new Readability(doc);
+        const article = reader.parse();
+
+        const extracted: Paragraph[] = [];
+        let pageTitle = "Untitled Article";
+        
+        if (article && article.content) {
+          pageTitle = article.title || "Untitled Article";
+          const contentDoc = parser.parseFromString(article.content, "text/html");
+          const elements = Array.from(contentDoc.querySelectorAll('p, h1, h2, h3, h4, li, blockquote')).filter(el => !el.closest('nav'));
+          
+          elements.forEach((el, index) => {
+            const text = el.textContent?.trim();
+            if (text && text.length > 20) {
+              extracted.push({
+                id: `p-${index}`,
+                originalText: text,
+                translatedText: null,
+                isLoading: false,
+                isAudioLoading: false,
+                isPlaying: false,
+                isPaused: false,
+                isCached: false,
+              });
+            }
+          });
+        }
+        return { article, extracted, pageTitle };
+      };
+
+      let { article, extracted, pageTitle } = processHtml(html);
+
+      if (extracted.length === 0 && !activeSession.url.includes("localhost") && !activeSession.url.includes("127.0.0.1")) {
+        try {
+          console.log("No content found (possibly an SPA). Retrying with Jina Reader...");
+          const jinaHtml: string = await invoke("fetch_html_jina", { url: activeSession.url });
+          const jinaResult = processHtml(jinaHtml);
+          if (jinaResult.extracted.length > 0) {
+            // Jina Readerで取得したHTML（レンダリング済み）からscriptタグを削除
+            // これによりReactなどのSPAがiframe内で再度起動し、ルーティング不一致で404画面に上書きされるのを防ぐ
+            const parser = new DOMParser();
+            const doc = parser.parseFromString(jinaHtml, "text/html");
+            doc.querySelectorAll('script').forEach(s => s.remove());
+            
+            html = doc.documentElement.outerHTML;
+            article = jinaResult.article;
+            extracted = jinaResult.extracted;
+            pageTitle = jinaResult.pageTitle;
+          }
+        } catch (e) {
+          console.warn("Jina Reader fallback failed", e);
+        }
+      }
 
       if (article && article.content) {
-        const pageTitle = article.title || "Untitled Article";
-        const contentDoc = parser.parseFromString(article.content, "text/html");
-        const elements = Array.from(contentDoc.querySelectorAll('p, h1, h2, h3, h4, li, blockquote')).filter(el => !el.closest('nav'));
-        
-        const extracted: Paragraph[] = [];
-        elements.forEach((el, index) => {
-          const text = el.textContent?.trim();
-          if (text && text.length > 20) {
-            extracted.push({
-              id: `p-${index}`,
-              originalText: text,
-              translatedText: null,
-              isLoading: false,
-              isAudioLoading: false,
-              isPlaying: false,
-              isPaused: false,
-              isCached: false,
-            });
-          }
-        });
         
         // --- 注入 (インジェクション) 用 HTML の生成 ---
         const urlObj = new URL(activeSession.url);
