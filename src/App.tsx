@@ -907,6 +907,9 @@ function App() {
            if (el) {
               el.scrollIntoView({ behavior: 'smooth', block: 'center' });
            }
+           if (iframeRef.current && iframeRef.current.contentWindow) {
+              iframeRef.current.contentWindow.postMessage({ type: 'HIGHLIGHT', text: activeSession.paragraphs[bestMatchIdx].originalText }, '*');
+           }
         }
       }
     };
