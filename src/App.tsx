@@ -138,6 +138,10 @@ function App() {
   const [activeSessionId, setActiveSessionId] = useState<string>("default");
   const [activeParagraphId, setActiveParagraphId] = useState<string | null>(null);
 
+  const [draggedSessionId, setDraggedSessionId] = useState<string | null>(null);
+  const [dragOverSessionId, setDragOverSessionId] = useState<string | null>(null);
+  const [dragOverPosition, setDragOverPosition] = useState<"top" | "bottom" | null>(null);
+
   const [isLoaded, setIsLoaded] = useState(false);
 
   useEffect(() => {
@@ -393,6 +397,81 @@ function App() {
       return filtered;
     });
   };
+
+  const handleDragStart = (e: React.DragEvent, id: string) => {
+    setDraggedSessionId(id);
+    e.dataTransfer.effectAllowed = "move";
+    e.dataTransfer.setData("text/plain", id);
+  };
+
+  const handleDragOver = (e: React.DragEvent, id: string) => {
+    e.preventDefault();
+    e.dataTransfer.dropEffect = "move";
+    
+    if (draggedSessionId === id) return;
+
+    const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+    const isTopHalf = e.clientY < rect.top + rect.height / 2;
+    const newPosition = isTopHalf ? "top" : "bottom";
+
+    if (dragOverSessionId !== id || dragOverPosition !== newPosition) {
+      setDragOverSessionId(id);
+      setDragOverPosition(newPosition);
+    }
+  };
+
+  const handleDragLeave = (e: React.DragEvent, id: string) => {
+    if (dragOverSessionId === id) {
+      setDragOverSessionId(null);
+      setDragOverPosition(null);
+    }
+  };
+
+  const handleDrop = (e: React.DragEvent, targetId: string) => {
+    e.preventDefault();
+    const sourceId = e.dataTransfer.getData("text/plain") || draggedSessionId;
+    
+    const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+    const isTopHalf = e.clientY < rect.top + rect.height / 2;
+    
+    setDragOverSessionId(null);
+    setDragOverPosition(null);
+    setDraggedSessionId(null);
+
+    if (!sourceId || sourceId === targetId) {
+      return;
+    }
+
+    setSessions(prev => {
+      const draggedIndex = prev.findIndex(s => s.id === sourceId);
+      const targetIndex = prev.findIndex(s => s.id === targetId);
+      
+      if (draggedIndex === -1 || targetIndex === -1) return prev;
+      
+      const newSessions = [...prev];
+      const draggedItem = newSessions[draggedIndex];
+      newSessions.splice(draggedIndex, 1);
+      
+      let adjustedTargetIndex = targetIndex;
+      if (draggedIndex < targetIndex) {
+        adjustedTargetIndex--;
+      }
+      
+      if (!isTopHalf) {
+        adjustedTargetIndex++;
+      }
+      
+      newSessions.splice(adjustedTargetIndex, 0, draggedItem);
+      return newSessions;
+    });
+  };
+
+  const handleDragEnd = () => {
+    setDraggedSessionId(null);
+    setDragOverSessionId(null);
+    setDragOverPosition(null);
+  };
+
 
   const loadArticle = async (e?: React.FormEvent) => {
     if (e) e.preventDefault();
@@ -948,19 +1027,31 @@ function App() {
           <span className="font-bold text-neutral-800 tracking-wide text-lg">Bilin</span>
         </div>
 
-        <div className="flex-1 px-3 space-y-2 overflow-y-auto">
+        <div className="flex-1 px-3 py-2 space-y-2 overflow-y-auto">
           {sessions.map((s, idx) => {
             const isActive = s.id === activeSessionId;
             let domain = "";
             try { if (s.url) domain = new URL(s.url).hostname; } catch(e) {}
             const faviconUrl = domain ? `https://www.google.com/s2/favicons?sz=64&domain_url=${encodeURIComponent(domain)}` : "";
             
+            const isDropTop = dragOverSessionId === s.id && dragOverPosition === "top";
+            const isDropBottom = dragOverSessionId === s.id && dragOverPosition === "bottom";
+            
             return (
               <div 
                 key={s.id}
+                draggable
+                onDragStart={(e) => handleDragStart(e, s.id)}
+                onDragOver={(e) => handleDragOver(e, s.id)}
+                onDragLeave={(e) => handleDragLeave(e, s.id)}
+                onDrop={(e) => handleDrop(e, s.id)}
+                onDragEnd={handleDragEnd}
                 onClick={() => setActiveSessionId(s.id)}
-                className={`group w-full h-10 rounded-xl flex items-center px-3 cursor-pointer transition
-                  ${isActive ? 'bg-blue-50 border border-blue-100 text-blue-700 shadow-sm' : 'bg-transparent text-neutral-600 border border-transparent hover:bg-neutral-100 hover:text-neutral-900'}`}
+                className={`group w-full h-10 rounded-xl flex items-center px-3 cursor-pointer transition relative
+                  ${isActive ? 'bg-blue-50 border border-blue-100 text-blue-700 shadow-sm' : 'bg-transparent text-neutral-600 border border-transparent hover:bg-neutral-100 hover:text-neutral-900'}
+                  ${draggedSessionId === s.id ? 'opacity-40 border-dashed border-neutral-300' : ''}
+                  ${isDropTop ? 'before:absolute before:-top-[5px] before:left-0 before:right-0 before:h-[3px] before:bg-blue-500 before:rounded-full before:z-10' : ''}
+                  ${isDropBottom ? 'after:absolute after:-bottom-[5px] after:left-0 after:right-0 after:h-[3px] after:bg-blue-500 after:rounded-full after:z-10' : ''}`}
                 title={s.title || `Session ${idx + 1}`}
               >
                 {faviconUrl ? (
