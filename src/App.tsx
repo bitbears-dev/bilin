@@ -501,6 +501,15 @@ function App() {
           doc.title = originalTitle;
         }
 
+        // asideタグはReadabilityによって不要なサイドバーと判定され削除されやすい。
+        // コールアウトなどの重要な情報を維持するため、処理前にblockquoteに変換する。
+        doc.querySelectorAll('aside').forEach(aside => {
+          const bq = doc.createElement('blockquote');
+          bq.innerHTML = aside.innerHTML;
+          bq.className = aside.className;
+          aside.replaceWith(bq);
+        });
+
         const reader = new Readability(doc);
         const article = reader.parse();
 
