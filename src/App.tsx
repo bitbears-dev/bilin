@@ -405,8 +405,23 @@ function App() {
       
       const processHtml = (htmlStr: string) => {
         const parser = new DOMParser();
+        
+        // DOMPurifyはデフォルトのHTMLプロファイルにおいて、安全のため<body>以外の要素（<head>や<title>等）を一律削除します。
+        // これにより、後続のReadabilityで正確な記事タイトルが取得できない（フォールバックの<h1>抽出にも失敗する）ケースがあります。
+        // これを防ぐため、サニタイズ前の生のHTMLからタイトルを抽出しておきます。
+        // ここで取得する `rawDoc.title` はDOM要素ではなく純粋なテキスト文字列であり、
+        // 最終的にReact側でエスケープされて描画されるため、XSS等のセキュリティリスクはありません。
+        const rawDoc = parser.parseFromString(htmlStr, "text/html");
+        const originalTitle = rawDoc.title;
+
         const cleanHtml = DOMPurify.sanitize(htmlStr, { USE_PROFILES: { html: true } });
         const doc = parser.parseFromString(cleanHtml, "text/html");
+        
+        // Readabilityがタイトルを認識できるように、サニタイズ後のDOMにタイトルを再設定
+        if (originalTitle) {
+          doc.title = originalTitle;
+        }
+
         const reader = new Readability(doc);
         const article = reader.parse();
 
@@ -414,7 +429,7 @@ function App() {
         let pageTitle = "Untitled Article";
         
         if (article && article.content) {
-          pageTitle = article.title || "Untitled Article";
+          pageTitle = article.title || originalTitle || "Untitled Article";
           const contentDoc = parser.parseFromString(article.content, "text/html");
           const query = 'p, h1, h2, h3, h4, li, blockquote';
           let elements = Array.from(contentDoc.querySelectorAll(query)).filter(el => !el.closest('nav'));
