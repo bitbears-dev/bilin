@@ -416,7 +416,11 @@ function App() {
         if (article && article.content) {
           pageTitle = article.title || "Untitled Article";
           const contentDoc = parser.parseFromString(article.content, "text/html");
-          const elements = Array.from(contentDoc.querySelectorAll('p, h1, h2, h3, h4, li, blockquote')).filter(el => !el.closest('nav'));
+          const query = 'p, h1, h2, h3, h4, li, blockquote';
+          let elements = Array.from(contentDoc.querySelectorAll(query)).filter(el => !el.closest('nav'));
+          
+          // 内部にさらに抽出対象の要素を持つ要素（例: <li>の中に<p>がある場合など）を除外することで、重複カードの生成を防ぐ
+          elements = elements.filter(el => el.querySelector(query) === null);
           
           elements.forEach((el, index) => {
             const text = el.textContent?.trim();
