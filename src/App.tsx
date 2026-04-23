@@ -420,7 +420,7 @@ function App() {
     }
   };
 
-  const handleDragLeave = (e: React.DragEvent, id: string) => {
+  const handleDragLeave = (_: React.DragEvent, id: string) => {
     if (dragOverSessionId === id) {
       setDragOverSessionId(null);
       setDragOverPosition(null);
