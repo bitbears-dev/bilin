@@ -523,10 +523,19 @@ function App() {
           let elements = Array.from(contentDoc.querySelectorAll(query)).filter(el => !el.closest('nav'));
           
           // 内部にさらに抽出対象の要素を持つ要素（例: <li>の中に<p>がある場合など）を除外することで、重複カードの生成を防ぐ
-          elements = elements.filter(el => el.querySelector(query) === null);
+          // これを、要素を除外するのではなく、クローンして内部の対象要素を削除してからテキストを抽出するように変更
+          // elements = elements.filter(el => el.querySelector(query) === null);
           
           elements.forEach((el, index) => {
-            const text = el.textContent?.trim();
+            let text = '';
+            if (el.querySelector(query)) {
+              const clone = el.cloneNode(true) as HTMLElement;
+              clone.querySelectorAll(query).forEach(nested => nested.remove());
+              text = clone.textContent?.trim() || '';
+            } else {
+              text = el.textContent?.trim() || '';
+            }
+
             if (text && text.length > 20) {
               extracted.push({
                 id: `p-${index}`,
@@ -602,7 +611,14 @@ function App() {
 
                const target = e.target.closest('p, h1, h2, h3, h4, li, blockquote, div');
                if (target) {
-                  const text = target.textContent;
+                  let text = '';
+                  if (target.querySelector('p, h1, h2, h3, h4, li, blockquote')) {
+                     const clone = target.cloneNode(true);
+                     clone.querySelectorAll('p, h1, h2, h3, h4, li, blockquote').forEach(n => n.remove());
+                     text = clone.textContent || '';
+                  } else {
+                     text = target.textContent || '';
+                  }
                   if (text && text.trim().length > 0) {
                      window.parent.postMessage({ type: 'IFRAME_CLICK', text: text }, '*');
                   }
@@ -644,7 +660,14 @@ function App() {
 
                  // 要素単位でのマッチングを行う
                  for (const el of elements) {
-                    const normElText = normalize(el.textContent || '');
+                    let normElText = '';
+                    if (el.querySelector('p, h1, h2, h3, h4, li, blockquote')) {
+                       const clone = el.cloneNode(true);
+                       clone.querySelectorAll('p, h1, h2, h3, h4, li, blockquote').forEach(n => n.remove());
+                       normElText = normalize(clone.textContent || '');
+                    } else {
+                       normElText = normalize(el.textContent || '');
+                    }
                     if (normElText.length < 10) continue;
 
                     if (normElText === normText) {
