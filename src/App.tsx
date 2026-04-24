@@ -493,7 +493,17 @@ function App() {
         const rawDoc = parser.parseFromString(htmlStr, "text/html");
         const originalTitle = rawDoc.title;
 
-        const cleanHtml = DOMPurify.sanitize(htmlStr, { USE_PROFILES: { html: true } });
+        // ReadabilityやDOMPurifyはデフォルトで<noscript>を削除するため、
+        // Discourse等SSRコンテンツをnoscript内に格納するサイト向けにdivへ変換する
+        rawDoc.querySelectorAll('noscript').forEach(ns => {
+           const div = rawDoc.createElement('div');
+           div.innerHTML = ns.innerHTML || ns.textContent || '';
+           div.className = "bilin-noscript-extracted";
+           ns.replaceWith(div);
+        });
+        const htmlToSanitize = rawDoc.documentElement.outerHTML;
+
+        const cleanHtml = DOMPurify.sanitize(htmlToSanitize, { USE_PROFILES: { html: true } });
         const doc = parser.parseFromString(cleanHtml, "text/html");
         
         // Readabilityがタイトルを認識できるように、サニタイズ後のDOMにタイトルを再設定
@@ -514,42 +524,36 @@ function App() {
         const article = reader.parse();
 
         const extracted: Paragraph[] = [];
-        let pageTitle = "Untitled Article";
+        let pageTitle = (article && article.title) || originalTitle || "Untitled Article";
         
-        if (article && article.content) {
-          pageTitle = article.title || originalTitle || "Untitled Article";
-          const contentDoc = parser.parseFromString(article.content, "text/html");
-          const query = 'p, h1, h2, h3, h4, li, blockquote';
-          let elements = Array.from(contentDoc.querySelectorAll(query)).filter(el => !el.closest('nav'));
-          
-          // 内部にさらに抽出対象の要素を持つ要素（例: <li>の中に<p>がある場合など）を除外することで、重複カードの生成を防ぐ
-          // これを、要素を除外するのではなく、クローンして内部の対象要素を削除してからテキストを抽出するように変更
-          // elements = elements.filter(el => el.querySelector(query) === null);
-          
-          elements.forEach((el, index) => {
-            let text = '';
-            if (el.querySelector(query)) {
-              const clone = el.cloneNode(true) as HTMLElement;
-              clone.querySelectorAll(query).forEach(nested => nested.remove());
-              text = clone.textContent?.trim() || '';
-            } else {
-              text = el.textContent?.trim() || '';
-            }
+        const htmlToParse = (article && article.content) ? article.content : doc.body.innerHTML;
+        const contentDoc = parser.parseFromString(htmlToParse, "text/html");
+        const query = 'p, h1, h2, h3, h4, li, blockquote';
+        let elements = Array.from(contentDoc.querySelectorAll(query)).filter(el => !el.closest('nav') && !el.closest('header') && !el.closest('footer'));
+        
+        elements.forEach((el, index) => {
+          let text = '';
+          if (el.querySelector(query)) {
+            const clone = el.cloneNode(true) as HTMLElement;
+            clone.querySelectorAll(query).forEach(nested => nested.remove());
+            text = clone.textContent?.trim() || '';
+          } else {
+            text = el.textContent?.trim() || '';
+          }
 
-            if (text && text.length > 20) {
-              extracted.push({
-                id: `p-${index}`,
-                originalText: text,
-                translatedText: null,
-                isLoading: false,
-                isAudioLoading: false,
-                isPlaying: false,
-                isPaused: false,
-                isCached: false,
-              });
-            }
-          });
-        }
+          if (text && text.length > 20) {
+            extracted.push({
+              id: `p-${index}`,
+              originalText: text,
+              translatedText: null,
+              isLoading: false,
+              isAudioLoading: false,
+              isPlaying: false,
+              isPaused: false,
+              isCached: false,
+            });
+          }
+        });
         return { article, extracted, pageTitle };
       };
 
@@ -561,13 +565,7 @@ function App() {
           const jinaHtml: string = await invoke("fetch_html_jina", { url: activeSession.url });
           const jinaResult = processHtml(jinaHtml);
           if (jinaResult.extracted.length > 0) {
-            // Jina Readerで取得したHTML（レンダリング済み）からscriptタグを削除
-            // これによりReactなどのSPAがiframe内で再度起動し、ルーティング不一致で404画面に上書きされるのを防ぐ
-            const parser = new DOMParser();
-            const doc = parser.parseFromString(jinaHtml, "text/html");
-            doc.querySelectorAll('script').forEach(s => s.remove());
-            
-            html = doc.documentElement.outerHTML;
+            html = jinaHtml;
             article = jinaResult.article;
             extracted = jinaResult.extracted;
             pageTitle = jinaResult.pageTitle;
@@ -577,7 +575,7 @@ function App() {
         }
       }
 
-      if (article && article.content) {
+
         
         // --- 注入 (インジェクション) 用 HTML の生成 ---
         const urlObj = new URL(activeSession.url);
@@ -730,7 +728,26 @@ function App() {
           </script>
         `;
 
-        let finalHtml = html;
+        // ReactなどのSPAがiframe内で起動し、ルーティング不一致で404画面に上書きされるのを防ぐため、
+        // 最終的なiframeContentを生成する前に元のHTMLからすべてのscriptタグを削除する
+        const parserForIframe = new DOMParser();
+        const docForIframe = parserForIframe.parseFromString(html, "text/html");
+        docForIframe.querySelectorAll('script').forEach(s => s.remove());
+
+        // JS無効化に伴い、SSRコンテンツが格納されたnoscriptを展開する
+        // (iframeはallow-scripts属性を持つため、デフォルトではnoscriptが表示されない)
+        docForIframe.querySelectorAll('noscript').forEach(ns => {
+           const div = docForIframe.createElement('div');
+           div.innerHTML = ns.innerHTML || ns.textContent || '';
+           div.className = "bilin-noscript-extracted";
+           ns.replaceWith(div);
+        });
+
+        // JS無効化に伴い永遠に表示され続けるローディングアニメーションを削除
+        docForIframe.querySelectorAll('#discourse-boot-spinner, .spinner, #loader, .d-spinner, .is-loading').forEach(el => el.remove());
+
+        let finalHtml = docForIframe.documentElement.outerHTML;
+
         if (finalHtml.toLowerCase().includes('<head>')) {
            finalHtml = finalHtml.replace(/<head>/i, '<head>' + injectionScript);
         } else {
@@ -753,7 +770,7 @@ function App() {
             }
           } catch(err) {}
         });
-      }
+
     } catch (err) {
       console.error(err);
       window.alert("ページの取得に失敗しました。\n" + String(err));

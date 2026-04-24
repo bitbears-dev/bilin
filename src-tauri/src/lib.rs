@@ -27,7 +27,7 @@ async fn fetch_html_jina(url: String) -> Result<String, String> {
     let jina_url = format!("https://r.jina.ai/{}", url);
     client
         .get(&jina_url)
-        .header("X-Return-Format", "html")
+        .header("x-respond-with", "html")
         .send()
         .await
         .map_err(|e| format!("Failed to fetch from Jina: {}", e))?
