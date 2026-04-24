@@ -63,4 +63,25 @@ npm run tauri build
 
 ---
 
+## 🚢 Release Process
+
+To release a new version of Bilin, we use npm's built-in versioning system which automatically updates all necessary files and tags the release for GitHub Actions.
+
+1. Ensure your working directory is clean (`git status` shows no uncommitted changes).
+2. Run the following command to bump the version (e.g., to `1.2.3`):
+   ```bash
+   npm version 1.2.3
+   ```
+   *This command automatically:*
+   - *Updates `package.json` and `package-lock.json`.*
+   - *Updates `src-tauri/Cargo.toml` and `src-tauri/tauri.conf.json`.*
+   - *Commits all these changes and creates a Git tag `v1.2.3`.*
+3. Push the commit and the tags to the remote repository:
+   ```bash
+   git push origin main --tags
+   ```
+4. GitHub Actions will automatically trigger the `Release` workflow, build binaries for Windows, macOS, and Linux, and draft a new release on the Releases page.
+
+---
+
 **Built with:** [Tauri v2](https://v2.tauri.app/), React, Tailwind CSS, Rust, and OpenAI.

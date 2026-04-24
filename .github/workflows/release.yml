@@ -26,6 +26,51 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Verify Version Consistency
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          # 1. 期待されるバージョン (タグ名の 'v' を除いたもの)
+          TAG_NAME=${GITHUB_REF#refs/tags/}
+          EXPECTED_VERSION=${TAG_NAME#v}
+          echo "Expected version from tag: $EXPECTED_VERSION"
+
+          # 2. package.json のバージョン
+          PACKAGE_VERSION=$(jq -r '.version' package.json)
+          echo "package.json version: $PACKAGE_VERSION"
+
+          # 3. tauri.conf.json のバージョン
+          TAURI_VERSION=$(jq -r '.version' src-tauri/tauri.conf.json)
+          echo "tauri.conf.json version: $TAURI_VERSION"
+
+          # 4. Cargo.toml のバージョン
+          CARGO_VERSION=$(grep '^version = ' src-tauri/Cargo.toml | head -n 1 | cut -d '"' -f 2)
+          echo "Cargo.toml version: $CARGO_VERSION"
+
+          # バージョンの比較
+          HAS_ERROR=0
+
+          if [ "$EXPECTED_VERSION" != "$PACKAGE_VERSION" ]; then
+            echo "::error::package.json version ($PACKAGE_VERSION) does not match tag version ($EXPECTED_VERSION)."
+            HAS_ERROR=1
+          fi
+
+          if [ "$EXPECTED_VERSION" != "$TAURI_VERSION" ]; then
+            echo "::error::tauri.conf.json version ($TAURI_VERSION) does not match tag version ($EXPECTED_VERSION)."
+            HAS_ERROR=1
+          fi
+
+          if [ "$EXPECTED_VERSION" != "$CARGO_VERSION" ]; then
+            echo "::error::Cargo.toml version ($CARGO_VERSION) does not match tag version ($EXPECTED_VERSION)."
+            HAS_ERROR=1
+          fi
+
+          if [ "$HAS_ERROR" -eq 1 ]; then
+            exit 1
+          fi
+
+          echo "All versions match!"
+
       - name: Node.js setup
         uses: actions/setup-node@v4
         with:
