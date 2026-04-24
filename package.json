@@ -1,14 +1,14 @@
 {
   "name": "tauri-app",
   "private": true,
-  "version": "1.0.0",
+  "version": "1.1.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
     "tauri": "tauri",
-    "version": "node scripts/bump-version.js && git add src-tauri/Cargo.toml src-tauri/tauri.conf.json"
+    "version": "node scripts/bump-version.js && git add src-tauri/Cargo.toml src-tauri/tauri.conf.json src-tauri/Cargo.lock"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.90.0",

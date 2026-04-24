@@ -1,6 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { execSync } from 'child_process';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -22,4 +23,8 @@ let cargoToml = fs.readFileSync(cargoTomlPath, 'utf8');
 cargoToml = cargoToml.replace(/^version\s*=\s*"[^"]+"/m, `version = "${version}"`);
 fs.writeFileSync(cargoTomlPath, cargoToml);
 
-console.log(`Updated tauri.conf.json and Cargo.toml to version ${version}`);
+// Cargo.lock の更新
+console.log('Updating Cargo.lock...');
+execSync('cargo update -p tauri-app', { cwd: path.join(__dirname, '../src-tauri'), stdio: 'inherit' });
+
+console.log(`Updated tauri.conf.json, Cargo.toml, and Cargo.lock to version ${version}`);
